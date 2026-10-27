@@ -4,6 +4,15 @@ Le o mapa de obstaculos poligonais produzido por 'gerar_mapa.py'
 (mapa_obstaculos.json) e gera uma trajetoria do ponto inicial ate o
 objetivo por descida de gradiente sobre o potencial total
 U = U_atrativo + U_repulsivo.
+
+O robo e modelado como uma particula: um ponto sem dimensao, cuja
+configuracao e apenas (x, y). Ele nao tem raio nem orientacao, e a
+colisao e simplesmente o ponto estar dentro de um obstaculo.
+
+A funcao 'expandir_obstaculos' permite, opcionalmente, inflar os
+obstaculos por uma margem de seguranca (soma de Minkowski com um
+disco). Essa margem e uma propriedade do *mapa*, nao do robo, e por
+padrao e zero: sem ela o planejamento e o do ponto puro.
 """
 
 import argparse
@@ -72,8 +81,8 @@ def dist_ponto_poligono(q, poligono):
 
 # ------------------------------------------------- expansao (Minkowski)
 
-def expandir_obstaculos(obstaculos, raio, limites, passo=0.002):
-    """Soma de Minkowski de cada obstaculo com um disco de raio 'raio'.
+def expandir_obstaculos(obstaculos, margem, limites, passo=0.002):
+    """Soma de Minkowski de cada obstaculo com um disco de raio 'margem'.
 
     Implementada como dilatacao morfologica com elemento estruturante
     circular: por definicao, a dilatacao de um conjunto por um disco E a
@@ -83,31 +92,32 @@ def expandir_obstaculos(obstaculos, raio, limites, passo=0.002):
     arestas deslocadas se auto-interceptam, e obstaculos que se fundem
     ao crescer.
 
-    O resultado e o obstaculo no espaco de configuracao (C-space): com
-    ele o robo de raio 'raio' pode ser tratado como uma particula.
+    'margem' e uma folga de seguranca do mapa, nao uma dimensao do robo:
+    o robo continua sendo uma particula em qualquer caso. Com margem 0
+    (o padrao) a funcao devolve os obstaculos inalterados.
 
     Pode devolver menos poligonos que a entrada, quando dois obstaculos
     se encostam apos a expansao.
     """
-    if raio <= 0.0:
+    if margem <= 0.0:
         return [np.asarray(o, dtype=float) for o in obstaculos]
 
     import cv2
 
     x0, y0 = limites["x_min"], limites["y_min"]
-    margem = raio + 4 * passo
-    largura = int(np.ceil((limites["x_max"] - x0 + 2 * margem) / passo))
-    altura = int(np.ceil((limites["y_max"] - y0 + 2 * margem) / passo))
+    borda = margem + 4 * passo
+    largura = int(np.ceil((limites["x_max"] - x0 + 2 * borda) / passo))
+    altura = int(np.ceil((limites["y_max"] - y0 + 2 * borda) / passo))
 
     def para_pixel(pts):
-        return np.round((np.asarray(pts) - [x0 - margem, y0 - margem])
+        return np.round((np.asarray(pts) - [x0 - borda, y0 - borda])
                         / passo).astype(np.int32)
 
     mascara = np.zeros((altura, largura), dtype=np.uint8)
     for poligono in obstaculos:
         cv2.fillPoly(mascara, [para_pixel(poligono)], 255)
 
-    raio_px = int(np.ceil(raio / passo))
+    raio_px = int(np.ceil(margem / passo))
     disco = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (2 * raio_px + 1, 2 * raio_px + 1))
     mascara = cv2.dilate(mascara, disco)
@@ -118,23 +128,23 @@ def expandir_obstaculos(obstaculos, raio, limites, passo=0.002):
     expandidos = []
     for c in contornos:
         # Simplifica mantendo o erro bem abaixo da resolucao do raster.
-        c = cv2.approxPolyDP(c, 0.8 * passo / passo * 1.0, True)
-        pts = c.reshape(-1, 2).astype(float) * passo + [x0 - margem,
-                                                        y0 - margem]
+        c = cv2.approxPolyDP(c, 0.8, True)   # 0.8 pixel
+        pts = c.reshape(-1, 2).astype(float) * passo + [x0 - borda,
+                                                        y0 - borda]
         if len(pts) >= 3:
             expandidos.append(pts)
     return expandidos
 
 
-def encolher_limites(limites, raio):
-    """Workspace reduzido de 'raio': o C-space das paredes."""
-    if not limites or raio <= 0.0:
+def encolher_limites(limites, margem):
+    """Workspace reduzido da mesma margem aplicada aos obstaculos."""
+    if not limites or margem <= 0.0:
         return limites
     return {
-        "x_min": limites["x_min"] + raio,
-        "x_max": limites["x_max"] - raio,
-        "y_min": limites["y_min"] + raio,
-        "y_max": limites["y_max"] - raio,
+        "x_min": limites["x_min"] + margem,
+        "x_max": limites["x_max"] - margem,
+        "y_min": limites["y_min"] + margem,
+        "y_max": limites["y_max"] - margem,
     }
 
 
@@ -335,16 +345,26 @@ def mapa_exemplo():
     ], {"x_min": 0.0, "x_max": 1.2, "y_min": 0.0, "y_max": 0.8}
 
 
-def plotar(caminho, obstaculos, inicio, objetivo, limites, arquivo):
+def plotar(caminho, obstaculos, expandidos, inicio, objetivo, limites,
+           arquivo):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.patches import Polygon
 
     fig, ax = plt.subplots(figsize=(8, 6))
-    for poligono in obstaculos:
+    mostrar_margem = len(expandidos) != len(obstaculos) or any(
+        len(a) != len(b) for a, b in zip(expandidos, obstaculos))
+    if mostrar_margem:
+        for i, poligono in enumerate(expandidos):
+            ax.add_patch(Polygon(
+                poligono, closed=True, facecolor="0.85", edgecolor="r",
+                ls="--", lw=1.2,
+                label="margem de seguranca" if i == 0 else None))
+    for i, poligono in enumerate(obstaculos):
         ax.add_patch(Polygon(poligono, closed=True, facecolor="0.6",
-                             edgecolor="k"))
+                             edgecolor="k",
+                             label="obstaculo" if i == 0 else None))
     ax.plot(caminho[:, 0], caminho[:, 1], "-b", lw=2, label="trajetoria")
     ax.plot(*inicio, "go", ms=10, label="inicio")
     ax.plot(*objetivo, "r*", ms=15, label="objetivo")
@@ -353,7 +373,7 @@ def plotar(caminho, obstaculos, inicio, objetivo, limites, arquivo):
     ax.set_aspect("equal")
     ax.set_xlabel("x [m]")
     ax.set_ylabel("y [m]")
-    ax.legend()
+    ax.legend(loc="best", fontsize=8)
     ax.grid(True, alpha=0.3)
     fig.savefig(arquivo, dpi=120, bbox_inches="tight")
     print(f"[OK] Figura salva em '{arquivo}'")
@@ -367,7 +387,12 @@ def main():
     ap.add_argument("--objetivo", type=float, nargs=2, default=[1.1, 0.7])
     ap.add_argument("--k-attr", type=float, default=1.0)
     ap.add_argument("--k-rep", type=float, default=0.001)
-    ap.add_argument("--d0", type=float, default=0.08)
+    ap.add_argument("--d0", type=float, default=0.08,
+                    help="raio de influencia do campo repulsivo [m]")
+    ap.add_argument("--margem", type=float, default=0.0,
+                    help="margem de seguranca [m] somada aos obstaculos "
+                         "(Minkowski). O robo e sempre uma particula; "
+                         "0 (padrao) planeja com os obstaculos reais")
     ap.add_argument("--alpha", type=float, default=0.02)
     ap.add_argument("--max-iter", type=int, default=5000)
     ap.add_argument("--saida", default="trajetoria.json")
@@ -381,10 +406,27 @@ def main():
         obstaculos, limites = mapa_exemplo()
         print(f"[AVISO] '{args.mapa}' nao encontrado; usando mapa de exemplo")
 
+    # O robo e uma particula. A margem, quando pedida, infla os
+    # obstaculos do mapa -- nao e uma dimensao do robo.
+    expandidos = expandir_obstaculos(obstaculos, args.margem, limites)
+    limites_c = encolher_limites(limites, args.margem)
+    if args.margem > 0:
+        print(f"[OK] Margem de {args.margem} m aplicada aos obstaculos "
+              f"(Minkowski): {len(obstaculos)} -> {len(expandidos)} "
+              f"poligonos")
+
+    for nome, ponto in (("inicio", args.inicio), ("objetivo", args.objetivo)):
+        if any(dist_ponto_poligono(np.array(ponto), o) <= 0
+               for o in expandidos):
+            print(f"[ERRO] O {nome} {ponto} esta dentro de um obstaculo: "
+                  f"escolha outro ponto (ou reduza --margem).")
+            return
+
     caminho, sucesso = plan_potencial(
-        args.inicio, args.objetivo, obstaculos,
+        args.inicio, args.objetivo, expandidos,
         alpha=args.alpha, max_iter=args.max_iter,
-        k_attr=args.k_attr, k_rep=args.k_rep, d0=args.d0, limites=limites)
+        k_attr=args.k_attr, k_rep=args.k_rep, d0=args.d0,
+        limites=limites_c)
 
     if sucesso:
         print(f"[OK] Objetivo alcancado em {len(caminho)} passos")
@@ -398,13 +440,15 @@ def main():
             "objetivo_xy_m": list(args.objetivo),
             "sucesso": bool(sucesso),
             "num_pontos": int(len(caminho)),
+            "modelo_robo": "particula",
+            "margem_seguranca_m": args.margem,
             "trajetoria_xy_m": caminho.round(5).tolist(),
         }, f, indent=4)
     print(f"[OK] Trajetoria salva em '{args.saida}'")
 
     try:
-        plotar(caminho, obstaculos, args.inicio, args.objetivo, limites,
-               args.figura)
+        plotar(caminho, obstaculos, expandidos, args.inicio, args.objetivo,
+               limites, args.figura)
     except ImportError:
         print("[AVISO] matplotlib indisponivel; figura nao gerada")
 
