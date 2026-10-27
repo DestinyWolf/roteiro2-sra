@@ -1,0 +1,2 @@
+python3 gerar_mapa.py --cam -larg 1.5 -altu 2.5 --ac n --ib n (espaço para gravar o frame)
+python3 gerar_trajetoria.py 

@@ -70,6 +70,74 @@ def dist_ponto_poligono(q, poligono):
     return -d if ponto_dentro_poligono(q, poligono) else d
 
 
+# ------------------------------------------------- expansao (Minkowski)
+
+def expandir_obstaculos(obstaculos, raio, limites, passo=0.002):
+    """Soma de Minkowski de cada obstaculo com um disco de raio 'raio'.
+
+    Implementada como dilatacao morfologica com elemento estruturante
+    circular: por definicao, a dilatacao de um conjunto por um disco E a
+    soma de Minkowski dos dois. Fazer isso sobre uma mascara rasterizada
+    (e nao deslocando as arestas uma a uma) resolve de graca os dois
+    casos em que o offset analitico falha: vertices reflexos, onde as
+    arestas deslocadas se auto-interceptam, e obstaculos que se fundem
+    ao crescer.
+
+    O resultado e o obstaculo no espaco de configuracao (C-space): com
+    ele o robo de raio 'raio' pode ser tratado como uma particula.
+
+    Pode devolver menos poligonos que a entrada, quando dois obstaculos
+    se encostam apos a expansao.
+    """
+    if raio <= 0.0:
+        return [np.asarray(o, dtype=float) for o in obstaculos]
+
+    import cv2
+
+    x0, y0 = limites["x_min"], limites["y_min"]
+    margem = raio + 4 * passo
+    largura = int(np.ceil((limites["x_max"] - x0 + 2 * margem) / passo))
+    altura = int(np.ceil((limites["y_max"] - y0 + 2 * margem) / passo))
+
+    def para_pixel(pts):
+        return np.round((np.asarray(pts) - [x0 - margem, y0 - margem])
+                        / passo).astype(np.int32)
+
+    mascara = np.zeros((altura, largura), dtype=np.uint8)
+    for poligono in obstaculos:
+        cv2.fillPoly(mascara, [para_pixel(poligono)], 255)
+
+    raio_px = int(np.ceil(raio / passo))
+    disco = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * raio_px + 1, 2 * raio_px + 1))
+    mascara = cv2.dilate(mascara, disco)
+
+    contornos, _ = cv2.findContours(
+        mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    expandidos = []
+    for c in contornos:
+        # Simplifica mantendo o erro bem abaixo da resolucao do raster.
+        c = cv2.approxPolyDP(c, 0.8 * passo / passo * 1.0, True)
+        pts = c.reshape(-1, 2).astype(float) * passo + [x0 - margem,
+                                                        y0 - margem]
+        if len(pts) >= 3:
+            expandidos.append(pts)
+    return expandidos
+
+
+def encolher_limites(limites, raio):
+    """Workspace reduzido de 'raio': o C-space das paredes."""
+    if not limites or raio <= 0.0:
+        return limites
+    return {
+        "x_min": limites["x_min"] + raio,
+        "x_max": limites["x_max"] - raio,
+        "y_min": limites["y_min"] + raio,
+        "y_max": limites["y_max"] - raio,
+    }
+
+
 # ---------------------------------------------------------------- potencial
 
 def potencial(q, objetivo, obstaculos, k_attr=1.0, k_rep=0.001, d0=0.08,
