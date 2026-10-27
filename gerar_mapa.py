@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 import json
+import glob
+import re
 from dataclasses import dataclass
 from typing import List, Tuple
 import argparse
@@ -221,13 +223,72 @@ def extrair_obstaculos_poligonais(mesa_img: np.ndarray, cfg: ConfigMapa):
 
 
 # ==============================================================================
-# 4. EXECUÇÃO PRINCIPAL
+# 4. CAPTURA VIA WEBCAM (Iriun / USB)
 # ==============================================================================
-def processar_mapa(caminho_imagem: str, cfg: ConfigMapa):
-    imagem = cv2.imread(caminho_imagem)
-    if imagem is None:
-        raise FileNotFoundError(f"Não foi possível carregar a imagem: {caminho_imagem}")
+def localizar_camera_por_nome(nome_busca: str) -> int:
+    """
+    Procura em /sys/class/video4linux um device cujo nome contenha 'nome_busca'
+    e retorna seu índice (ex: 2 para /dev/video2).
+    """
+    candidatos = []
+    for caminho_nome in sorted(glob.glob("/sys/class/video4linux/video*/name")):
+        try:
+            with open(caminho_nome, encoding="utf-8") as f:
+                nome_device = f.read().strip()
+        except OSError:
+            continue
+        if nome_busca.lower() in nome_device.lower():
+            indice = int(re.search(r"/video(\d+)/name$", caminho_nome).group(1))
+            candidatos.append((indice, nome_device))
 
+    if not candidatos:
+        raise RuntimeError(
+            f"Nenhuma câmera com '{nome_busca}' no nome foi encontrada. "
+            "Abra o app 'iriunwebcam' no PC e conecte o celular antes de rodar."
+        )
+
+    indice, nome_device = candidatos[0]
+    print(f"[INFO] Câmera encontrada: /dev/video{indice} ({nome_device})")
+    return indice
+
+
+def capturar_frame(indice_camera: int) -> np.ndarray:
+    """
+    Abre um preview ao vivo e devolve o frame congelado quando o usuário
+    pressiona ESPAÇO. ESC cancela.
+    """
+    cap = cv2.VideoCapture(indice_camera)
+    if not cap.isOpened():
+        raise RuntimeError(
+            f"Não foi possível abrir /dev/video{indice_camera}. "
+            "Verifique se o celular está transmitindo no app do Iriun."
+        )
+
+    nome_janela = "Captura: ESPACO para congelar | ESC para cancelar"
+    cv2.namedWindow(nome_janela, cv2.WINDOW_NORMAL)
+    print("\n[INSTRUÇÃO] Enquadre a mesa e pressione ESPAÇO para capturar.")
+
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                raise RuntimeError("Falha ao ler frame da câmera.")
+
+            cv2.imshow(nome_janela, frame)
+            tecla = cv2.waitKey(20) & 0xFF
+            if tecla == 32:
+                return frame.copy()
+            if tecla == 27:
+                raise RuntimeError("Captura cancelada pelo usuário.")
+    finally:
+        cap.release()
+        cv2.destroyWindow(nome_janela)
+
+
+# ==============================================================================
+# 5. EXECUÇÃO PRINCIPAL
+# ==============================================================================
+def processar_mapa(imagem: np.ndarray, cfg: ConfigMapa):
     # 1. Obter os 4 cantos da mesa
     if cfg.pontos_mesa_fixos is not None and len(cfg.pontos_mesa_fixos) == 4:
         cantos = ordenar_4_pontos(np.array(cfg.pontos_mesa_fixos, dtype="float32"))
@@ -282,18 +343,22 @@ def processar_mapa(caminho_imagem: str, cfg: ConfigMapa):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("img", help="Caminho/nome da imagem", type=str)
+    parser.add_argument("img", help="Caminho/nome da imagem", type=str, nargs="?")
     parser.add_argument("-larg", help="largura da mesa em metros (x)", type=float, default=1.2)
     parser.add_argument('-altu', help="altura da mesa  em metros (y)", type=float, default=0.8)
     parser.add_argument('--ac', help="auto calibração (s/y/n)", type=str, default='y')
     parser.add_argument('--ib', help="inverter cores (padrão mesa escura) (s/y/n)", type=str, default='y')
+    parser.add_argument('--cam', help="captura da webcam buscando o device pelo nome", type=str,
+                        nargs="?", const="Iriun", metavar="NOME")
 
     args = parser.parse_args()
+
+    if not args.img and not args.cam:
+        parser.error("informe o caminho de uma imagem ou use --cam")
 
     ad = True if (args.ac.lower() == 's' or args.ac.lower() == 'y') else False
     ib = True if (args.ib.lower() == 's' or args.ib.lower() == 'y') else False
 
-    path = args.img
     # Configure aqui os parâmetros reais da sua bancada
     config = ConfigMapa(
         largura_mesa_m=args.larg,          # Altere para a largura real (ou 1.0 se quiser normalizar como quadrado)
@@ -302,6 +367,12 @@ if __name__ == "__main__":
         inverter_binarizacao=ib    # Mude para True se a mesa for clara e os objetos escuros
     )
     
-    # Substitua pelo caminho da foto capturada pela ESP32-CAM (ou URL do stream/snapshot HTTP)
-    processar_mapa(path, config)
+    if args.cam:
+        imagem_entrada = capturar_frame(localizar_camera_por_nome(args.cam))
+    else:
+        imagem_entrada = cv2.imread(args.img)
+        if imagem_entrada is None:
+            raise FileNotFoundError(f"Não foi possível carregar a imagem: {args.img}")
+
+    processar_mapa(imagem_entrada, config)
 
