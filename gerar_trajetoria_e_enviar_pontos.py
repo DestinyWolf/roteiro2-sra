@@ -266,7 +266,9 @@ def carregar_mapa(caminho_json):
         for obs in dados.get("obstaculos", [])
     ]
     limites = dados.get("workspace_limites_m", {})
-    return obstaculos, limites
+
+    robo = dados.get("robo", {})
+    return obstaculos, limites, robo
 
 
 def mapa_exemplo():
@@ -275,7 +277,11 @@ def mapa_exemplo():
         poligono_regular((0.3, 0.3), 4, 0.08),
         poligono_regular((0.7, 0.5), 3, 0.10),
         poligono_regular((0.5, 0.65), 6, 0.09),
-    ], {"x_min": 0.0, "x_max": 1.2, "y_min": 0.0, "y_max": 0.8}
+    ], {"x_min": 0.0, "x_max": 1.2, "y_min": 0.0, "y_max": 0.8}, {"x_m": 0.4562,
+        "y_m": 0.2574,
+        "theta_rad": 1.4174,
+        "theta_graus": 81.21,
+        "raio_marcador_m": 0.0173}
 
 
 def plotar(caminho, obstaculos, inicio, objetivo, limites, arquivo):
@@ -421,7 +427,6 @@ def main():
     ap = argparse.ArgumentParser(
         description="Gera trajetoria por campos potenciais.")
     ap.add_argument("--mapa", default="mapa_obstaculos.json")
-    ap.add_argument("--inicio", type=float, nargs=2, default=[0.05, 0.05])
     ap.add_argument("--objetivo", type=float, nargs=2, default=[1.1, 0.7])
     ap.add_argument("--k-attr", type=float, default=1.0)
     ap.add_argument("--k-rep", type=float, default=0.001)
@@ -443,14 +448,16 @@ def main():
         sys.exit(1)
 
     try:
-        obstaculos, limites = carregar_mapa(args.mapa)
+        obstaculos, limites, robo = carregar_mapa(args.mapa)
         print(f"[OK] {len(obstaculos)} obstaculos lidos de '{args.mapa}'")
     except FileNotFoundError:
-        obstaculos, limites = mapa_exemplo()
+        obstaculos, limites, robo = mapa_exemplo()
         print(f"[AVISO] '{args.mapa}' nao encontrado; usando mapa de exemplo")
 
+    robo_inicio = [robo["x_m"], robo["y_m"]]
+
     caminho, sucesso = plan_potencial(
-        args.inicio, args.objetivo, obstaculos,
+        robo_inicio, args.objetivo, obstaculos,
         alpha=args.alpha, max_iter=args.max_iter,
         k_attr=args.k_attr, k_rep=args.k_rep, d0=args.d0, limites=limites)
 

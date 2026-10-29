@@ -4,7 +4,7 @@ import json
 import glob
 import re
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict
 import argparse
 
 # ==============================================================================
@@ -16,7 +16,9 @@ class ConfigMapa:
     # Se quiser tratar como um quadrado perfeito de 1x1m, basta usar 1.0 e 1.0
     largura_mesa_m: float = 1.20   # Eixo X em metros
     altura_mesa_m: float = 0.80    # Eixo Y em metros
-    
+    largura_camera_px: int = 1280
+    altura_camera_px: int = 720
+
     # Resolução interna da imagem retificada (ex: 600 px/m -> 1 pixel = 1.66 mm)
     pixels_por_metro: int = 600
     
@@ -25,7 +27,7 @@ class ConfigMapa:
     # False -> Abre a imagem para você clicar nos 4 cantos da mesa (ignora o chão com 100% de certeza)
     auto_detectar_mesa: bool = False
     
-    # Caso a ESP32-CAM esteja fixa em um suporte, você pode salvar os 4 pontos (em pixels da foto original)
+    # Caso a câmera esteja fixa em um suporte, você pode salvar os 4 pontos (em pixels da foto original)
     # aqui após a primeira calibração para não precisar clicar toda vez. Deixe None para desativar.
     pontos_mesa_fixos: List[Tuple[int, int]] = None
     
@@ -39,6 +41,16 @@ class ConfigMapa:
     area_min_objeto_m2: float = 0.0009 # Área mínima do objeto (ex: 3cm x 3cm = 0.0009 m²)
     epsilon_poligono: float = 0.025    # Fator de simplificação dos vértices (0.015 a 0.04)
     inverter_binarizacao: bool = False # True = objetos escuros em mesa clara | False = objetos claros em mesa escura
+
+    # Parâmetros para a detecção do robô (Vermelho / Laranja em HSV)
+    hsv_h_min1: int = 0
+    hsv_h_max1: int = 24
+    hsv_h_min2: int = 165
+    hsv_h_max2: int = 179
+    hsv_s_min: int = 110
+    hsv_v_min: int = 80
+    area_min_robo_m2: float = 0.0004   # Área mínima do marcador (ex: 2cm x 2cm = 0.0004 m²)
+    margem_exclusao_robo: float = 0.09 # Raio extra (em metros) para apagar o robô da máscara de obstáculos
 
 
 # ==============================================================================
@@ -128,7 +140,7 @@ def detectar_mesa_auto(imagem: np.ndarray) -> np.ndarray:
 
 
 # ==============================================================================
-# 3. RETIFICAÇÃO DE PERSPECTIVA E EXTRAÇÃO DOS POLÍGONOS
+# 3. RETIFICAÇÃO, DETECÇÃO DO ROBÔ (HSV) E EXTRAÇÃO DOS POLÍGONOS
 # ==============================================================================
 def retificar_mesa(imagem: np.ndarray, cantos_mesa: np.ndarray, cfg: ConfigMapa) -> np.ndarray:
     """
@@ -149,12 +161,110 @@ def retificar_mesa(imagem: np.ndarray, cantos_mesa: np.ndarray, cfg: ConfigMapa)
     return mesa_retificada
 
 
-def extrair_obstaculos_poligonais(mesa_img: np.ndarray, cfg: ConfigMapa):
+def pixel_para_metro(x_px: float, y_px: float, altura_px: int, cfg: ConfigMapa) -> Tuple[float, float]:
+    """Converte coordenadas de pixel da imagem retificada para metros (x, y)."""
+    x_m = x_px / cfg.pixels_por_metro
+    if cfg.origem_cartesiana_inferior:
+        y_m = (altura_px - y_px) / cfg.pixels_por_metro
+    else:
+        y_m = y_px / cfg.pixels_por_metro
+    return round(float(x_m), 4), round(float(y_m), 4)
+
+
+def detectar_robo_hsv(mesa_img: np.ndarray, cfg: ConfigMapa) -> Tuple[Optional[Dict], np.ndarray]:
+    """
+    Localiza o marcador vermelho/laranja do robô na imagem retificada da mesa.
+    Retorna:
+      - dados_robo: Dicionário com (x_m, y_m, theta_rad, theta_graus, vertices_xy_m, etc.) ou None
+      - mascara_exclusao_robo: Máscara binária dilatada da região do robô para removê-lo dos obstáculos
+    """
+    altura_px, _ = mesa_img.shape[:2]
+    blur = cv2.GaussianBlur(mesa_img, (5, 5), 0)
+    imagem_hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+
+    # Faixa 1: Vermelho-alaranjado e Laranja (Hue 0 a 24)
+    limite_inferior1 = np.array([cfg.hsv_h_min1, cfg.hsv_s_min, cfg.hsv_v_min], dtype=np.uint8)
+    limite_superior1 = np.array([cfg.hsv_h_max1, 255, 255], dtype=np.uint8)
+    mascara1 = cv2.inRange(imagem_hsv, limite_inferior1, limite_superior1)
+
+    # Faixa 2: Vermelho profundo / Magenta (Hue 165 a 179)
+    limite_inferior2 = np.array([cfg.hsv_h_min2, cfg.hsv_s_min, cfg.hsv_v_min], dtype=np.uint8)
+    limite_superior2 = np.array([cfg.hsv_h_max2, 255, 255], dtype=np.uint8)
+    mascara2 = cv2.inRange(imagem_hsv, limite_inferior2, limite_superior2)
+
+    mascara_robo = cv2.bitwise_or(mascara1, mascara2)
+
+    # Limpeza morfológica para eliminar ruídos pontuais
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mascara_robo = cv2.morphologyEx(mascara_robo, cv2.MORPH_OPEN, kernel, iterations=1)
+    mascara_robo = cv2.morphologyEx(mascara_robo, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contornos, _ = cv2.findContours(mascara_robo, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    mascara_exclusao = np.zeros_like(mascara_robo)
+
+    if not contornos:
+        return None, mascara_exclusao
+
+    maior_contorno = max(contornos, key=cv2.contourArea)
+    area_min_px = cfg.area_min_robo_m2 * (cfg.pixels_por_metro ** 2)
+
+    if cv2.contourArea(maior_contorno) < area_min_px:
+        return None, mascara_exclusao
+
+    M = cv2.moments(maior_contorno)
+    if M["m00"] == 0:
+        return None, mascara_exclusao
+
+    # Centroide do robô em pixels e em metros
+    cx_px = M["m10"] / M["m00"]
+    cy_px = M["m01"] / M["m00"]
+    robo_x_m, robo_y_m = pixel_para_metro(cx_px, cy_px, altura_px, cfg)
+
+    # Raio do marcador e orientação pelo eixo principal de inércia (momentos centrais)
+    (_, _), raio_px = cv2.minEnclosingCircle(maior_contorno)
+    raio_m = round(float(raio_px / cfg.pixels_por_metro), 4)
+
+    mu20 = M["mu20"] / M["m00"]
+    mu02 = M["mu02"] / M["m00"]
+    mu11 = M["mu11"] / M["m00"]
+    theta_img_rad = 0.5 * np.arctan2(2 * mu11, mu20 - mu02)
+    theta_rad = -theta_img_rad if cfg.origem_cartesiana_inferior else theta_img_rad
+
+    # Vértices aproximados do marcador do robô
+    perimetro = cv2.arcLength(maior_contorno, True)
+    vertices_robo_px = cv2.approxPolyDP(maior_contorno, cfg.epsilon_poligono * perimetro, True).reshape(-1, 2)
+    vertices_robo_m = np.array([pixel_para_metro(vx, vy, altura_px, cfg) for vx, vy in vertices_robo_px])
+
+    # Cria círculo dilatado na máscara de exclusão para apagar o robô da máscara de obstáculos
+    margem_exclusao_px = int(cfg.margem_exclusao_robo * cfg.pixels_por_metro)
+    cv2.circle(mascara_exclusao, (int(cx_px), int(cy_px)), int(raio_px + margem_exclusao_px), 255, -1)
+
+    dados_robo = {
+        "x_m": robo_x_m,
+        "y_m": robo_y_m,
+        "theta_rad": round(float(theta_rad), 4),
+        "theta_graus": round(float(np.degrees(theta_rad)), 2),
+        "raio_marcador_m": raio_m,
+        "vertices_xy_m": vertices_robo_m,
+        "centro_px": (int(cx_px), int(cy_px)),
+        "raio_px": int(raio_px)
+    }
+
+    return dados_robo, mascara_exclusao
+
+
+def extrair_obstaculos_poligonais(
+    mesa_img: np.ndarray,
+    cfg: ConfigMapa,
+    mascara_exclusao_robo: Optional[np.ndarray] = None,
+    dados_robo: Optional[Dict] = None
+):
     """
     Identifica os objetos sobre a mesa, extrai seus vértices e converte para metros.
     Retorna:
       - lista_poligonos_m: Lista de matrizes NumPy (N x 2) com coordenadas (x, y) em metros
-      - img_debug: Imagem anotada para conferência visual
+      - img_debug: Imagem anotada para conferência visual (obstáculos + robô)
+      - mascara: Máscara binária final dos obstáculos
     """
     altura_px, largura_px = mesa_img.shape[:2]
     cinza = cv2.cvtColor(mesa_img, cv2.COLOR_BGR2GRAY)
@@ -163,6 +273,10 @@ def extrair_obstaculos_poligonais(mesa_img: np.ndarray, cfg: ConfigMapa):
     # Limiarização de Otsu (separa fundo da mesa dos objetos automaticamente)
     tipo_thresh = cv2.THRESH_BINARY_INV if cfg.inverter_binarizacao else cv2.THRESH_BINARY
     _, mascara = cv2.threshold(blur, 0, 255, tipo_thresh + cv2.THRESH_OTSU)
+
+    # Remove a região do robô para que ele NÃO seja detectado como obstáculo
+    if mascara_exclusao_robo is not None:
+        mascara = cv2.bitwise_and(mascara, cv2.bitwise_not(mascara_exclusao_robo))
 
     # Zera as bordas da imagem para evitar que rebarbas da quina da mesa virem obstáculos
     margem_px = int(cfg.margem_borda_m * cfg.pixels_por_metro)
@@ -193,6 +307,9 @@ def extrair_obstaculos_poligonais(mesa_img: np.ndarray, cfg: ConfigMapa):
         vertices_px = cv2.approxPolyDP(c, cfg.epsilon_poligono * perimetro, True)
         vertices_px = vertices_px.reshape(-1, 2) # Formato (N, 2)
 
+        if len(vertices_px) < 3:
+            continue
+
         # Conversão de Pixels para Metros
         vertices_m = np.zeros_like(vertices_px, dtype=np.float64)
         vertices_m[:, 0] = vertices_px[:, 0] / cfg.pixels_por_metro # X em metros
@@ -205,7 +322,7 @@ def extrair_obstaculos_poligonais(mesa_img: np.ndarray, cfg: ConfigMapa):
 
         lista_poligonos_m.append(np.round(vertices_m, 4))
 
-        # --- Desenho na imagem de debug ---
+        # --- Desenho dos obstáculos na imagem de debug ---
         cv2.drawContours(img_debug, [vertices_px], -1, (0, 255, 0), 2)
         for vx, vy in vertices_px:
             cv2.circle(img_debug, (vx, vy), 5, (0, 0, 255), -1)
@@ -218,6 +335,24 @@ def extrair_obstaculos_poligonais(mesa_img: np.ndarray, cfg: ConfigMapa):
                 img_debug, f"Obj {len(lista_poligonos_m)} ({len(vertices_px)}v)",
                 (cx - 35, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2
             )
+
+    # --- Desenho do Robô na imagem de debug ---
+    if dados_robo is not None:
+        rx, ry = dados_robo["centro_px"]
+        r_px = dados_robo["raio_px"]
+        cv2.circle(img_debug, (rx, ry), r_px, (255, 255, 0), 2)
+        cv2.circle(img_debug, (rx, ry), 5, (0, 140, 255), -1)
+
+        ang_img = -dados_robo["theta_rad"] if cfg.origem_cartesiana_inferior else dados_robo["theta_rad"]
+        ponta_x = int(rx + (r_px + 15) * np.cos(ang_img))
+        ponta_y = int(ry + (r_px + 15) * np.sin(ang_img))
+        cv2.arrowedLine(img_debug, (rx, ry), (ponta_x, ponta_y), (255, 255, 0), 2, tipLength=0.3)
+
+        cv2.putText(
+            img_debug, f"ROBO ({dados_robo['x_m']:.2f}m, {dados_robo['y_m']:.2f}m)",
+            (max(10, rx - 70), max(20, ry - r_px - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2
+        )
 
     return lista_poligonos_m, img_debug, mascara
 
@@ -300,11 +435,33 @@ def processar_mapa(imagem: np.ndarray, cfg: ConfigMapa):
     # 2. Isolar e retificar a mesa
     mesa_retificada = retificar_mesa(imagem, cantos, cfg)
 
-    # 3. Extrair matrizes de vértices (x, y) em metros
-    poligonos_m, img_debug, mascara = extrair_obstaculos_poligonais(mesa_retificada, cfg)
+    # 3. Detectar o robô (vermelho/laranja) em HSV e gerar máscara de exclusão
+    dados_robo, mascara_exclusao_robo = detectar_robo_hsv(mesa_retificada, cfg)
 
-    # 4. Exibir resultados no terminal e exportar JSON
+    # 4. Extrair matrizes de vértices (x, y) dos obstáculos (sem incluir o robô)
+    poligonos_m, img_debug, mascara = extrair_obstaculos_poligonais(
+        mesa_retificada, cfg, mascara_exclusao_robo, dados_robo
+    )
+
+    # 5. Exibir resultados no terminal e exportar JSON
     print(f"\n================ MAPA EXTRAÍDO ({cfg.largura_mesa_m}m x {cfg.altura_mesa_m}m) ================")
+    if dados_robo is not None:
+        print(
+            f"[ROBÔ DETECTADO] Posição: (x = {dados_robo['x_m']} m, y = {dados_robo['y_m']} m) | "
+            f"Theta = {dados_robo['theta_graus']}° | Raio = {dados_robo['raio_marcador_m']} m"
+        )
+        robo_json = {
+            "x_m": dados_robo["x_m"],
+            "y_m": dados_robo["y_m"],
+            "theta_rad": dados_robo["theta_rad"],
+            "theta_graus": dados_robo["theta_graus"],
+            "raio_marcador_m": dados_robo["raio_marcador_m"],
+            "vertices_xy_m": dados_robo["vertices_xy_m"].tolist()
+        }
+    else:
+        print("[AVISO] Robô (marcador vermelho/laranja) NÃO foi detectado na mesa!")
+        robo_json = None
+
     print(f"Total de obstáculos detectados: {len(poligonos_m)}\n")
 
     dados_exportacao = {
@@ -315,6 +472,7 @@ def processar_mapa(imagem: np.ndarray, cfg: ConfigMapa):
             "y_max": cfg.altura_mesa_m,
             "origem": "inferior_esquerdo" if cfg.origem_cartesiana_inferior else "superior_esquerdo"
         },
+        "robo": robo_json,
         "obstaculos": []
     }
 
@@ -330,22 +488,22 @@ def processar_mapa(imagem: np.ndarray, cfg: ConfigMapa):
 
     with open("mapa_obstaculos.json", "w", encoding="utf-8") as f:
         json.dump(dados_exportacao, f, indent=4)
-    print("[OK] Matrizes salvas em 'mapa_obstaculos.json'")
+    print("[OK] Robô e matrizes de obstáculos salvos em 'mapa_obstaculos.json'")
 
-    # 5. Visualização final
-    cv2.imshow("1. Mascara Binaria", mascara)
-    cv2.imshow("2. Mesa Retificada e Vertices Detectados", img_debug)
+    # 6. Visualização final
+    cv2.imshow("1. Mascara Binaria (Obstaculos sem o Robo)", mascara)
+    cv2.imshow("2. Mesa Retificada, Robo e Vertices Detectados", img_debug)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
-    return poligonos_m
+    return dados_robo, poligonos_m
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("img", help="Caminho/nome da imagem", type=str, nargs="?")
     parser.add_argument("-larg", help="largura da mesa em metros (x)", type=float, default=1.2)
-    parser.add_argument('-altu', help="altura da mesa  em metros (y)", type=float, default=0.8)
+    parser.add_argument('-altu', help="altura da mesa em metros (y)", type=float, default=0.8)
     parser.add_argument('--ac', help="auto calibração (s/y/n)", type=str, default='y')
     parser.add_argument('--ib', help="inverter cores (padrão mesa escura) (s/y/n)", type=str, default='y')
     parser.add_argument('--cam', help="captura da webcam buscando o device pelo nome", type=str,
@@ -363,8 +521,8 @@ if __name__ == "__main__":
     config = ConfigMapa(
         largura_mesa_m=args.larg,          # Altere para a largura real (ou 1.0 se quiser normalizar como quadrado)
         altura_mesa_m=args.altu,           # Altere para a profundidade real (ou 1.0 se quiser normalizar como quadrado)
-        auto_detectar_mesa=ad,     # False = abre a janela para clicar nos 4 cantos da mesa
-        inverter_binarizacao=ib    # Mude para True se a mesa for clara e os objetos escuros
+        auto_detectar_mesa=ad,             # False = abre a janela para clicar nos 4 cantos da mesa
+        inverter_binarizacao=ib            # Mude para True se a mesa for clara e os objetos escuros
     )
     
     if args.cam:
@@ -375,4 +533,3 @@ if __name__ == "__main__":
             raise FileNotFoundError(f"Não foi possível carregar a imagem: {args.img}")
 
     processar_mapa(imagem_entrada, config)
-
