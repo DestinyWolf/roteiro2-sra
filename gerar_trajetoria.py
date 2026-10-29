@@ -29,9 +29,20 @@ puro.
 import argparse
 import heapq
 import json
-
 import numpy as np
+import serial
+import serial.tools.list_ports
+import sys
+import time
 
+DEFAULT_PORT = "COM11"
+DEFAULT_BAUD = 115200
+TIMEOUT_S = 1.0
+RESPONSE_TIMEOUT_S = 2.0
+AUTO_EQ_S = 2.0
+START_GRACE_S = 2.5
+
+STATE_NAMES = {0: "GIRAR", 1: "ANDAR", 2: "DONE"}
 
 # ---------------------------------------------------------------- geometria
 
@@ -629,6 +640,7 @@ def carregar_mapa(caminho_json):
         for obs in dados.get("obstaculos", [])
     ]
     limites = dados.get("workspace_limites_m", {})
+
     return obstaculos, limites, dados.get("robo")
 
 
@@ -645,6 +657,7 @@ def mapa_exemplo():
         poligono_regular((0.3, 0.3), 4, 0.08),
         poligono_regular((0.7, 0.5), 3, 0.10),
         poligono_regular((0.5, 0.65), 6, 0.09),
+
     ], {"x_min": 0.0, "x_max": 1.2, "y_min": 0.0, "y_max": 0.8}, None
 
 
@@ -817,6 +830,121 @@ def plotar(caminho, obstaculos, expandidos, inicio, objetivo, limites,
     print(f"[OK] Figura salva em '{arquivo}'")
 
 
+
+#-------------------------------------------------- Comandos do ROBO
+
+# ---------------------------------------------------------------------------
+# Conexão
+# ---------------------------------------------------------------------------
+def list_ports():
+    ports = serial.tools.list_ports.comports()
+    if not ports:
+        print("Nenhuma porta serial encontrada.")
+        return
+    print("Portas disponíveis:")
+    for p in ports:
+        print(f"  {p.device:20s}  {p.description}")
+
+
+def connect(port=DEFAULT_PORT, baud=DEFAULT_BAUD):
+    ser = serial.Serial(port, baud, timeout=TIMEOUT_S)
+    time.sleep(1.5)
+    ser.reset_input_buffer()
+    return ser
+
+# ---------------------------------------------------------------------------
+# Envio e leitura
+# ---------------------------------------------------------------------------
+def send(ser, cmd):
+    ser.write(f"<{cmd}>\n".encode("ascii"))
+    ser.flush()
+
+
+def read_response(ser, timeout=RESPONSE_TIMEOUT_S):
+    t0 = time.time()
+    buf = bytearray()
+    while time.time() - t0 < timeout:
+        b = ser.read(1)
+        if not b:
+            continue
+        buf += b
+        if b == b"\n":
+            line = buf.decode("ascii", errors="replace").strip()
+            if line.startswith("<") and line.endswith(">"):
+                return line
+            buf = bytearray()
+    return None
+
+
+def cmd_and_wait(ser, cmd, timeout=RESPONSE_TIMEOUT_S):
+    send(ser, cmd)
+    return read_response(ser, timeout)
+
+# ---------------------------------------------------------------------------
+# Waypoints
+# ---------------------------------------------------------------------------
+def add_waypoint(ser, x, y):
+    return cmd_and_wait(ser, f"A,{x:.3f},{y:.3f}")
+
+
+def set_waypoints(ser, pts):
+    if not pts:
+        return cmd_and_wait(ser, "C")
+    body = f"W,{len(pts)}"
+    for (x, y) in pts:
+        body += f",{x:.3f},{y:.3f}"
+    return cmd_and_wait(ser, body)
+
+
+def append_waypoints(ser, pts):
+    if not pts:
+        return None
+    body = f"Q,{len(pts)}"
+    for (x, y) in pts:
+        body += f",{x:.3f},{y:.3f}"
+    return cmd_and_wait(ser, body)
+
+
+def list_waypoints(ser):
+    resp = cmd_and_wait(ser, "L")
+    if resp is None or not resp.startswith("<L,"):
+        return None
+    parts = resp[1:-1].split(",")[1:]
+    n = int(parts[0])
+    wps = []
+    for i in range(n):
+        x = float(parts[1 + 2 * i])
+        y = float(parts[2 + 2 * i])
+        wps.append((x, y))
+    return wps
+
+
+def delete_waypoint(ser, idx):
+    return cmd_and_wait(ser, f"D,{idx}")
+
+
+def replace_waypoint(ser, idx, x, y):
+    return cmd_and_wait(ser, f"S,{idx},{x:.3f},{y:.3f}")
+
+# ---------------------------------------------------------------------------
+# Execução
+# ---------------------------------------------------------------------------
+def start(ser, wait_auto_eq=True):
+    resp = cmd_and_wait(ser, "R")
+    if resp is None:
+        return False, None, "sem resposta (timeout)"
+    if resp != "<OK>":
+        if resp == "<ERR>":
+            return False, resp, "lista vazia — envie waypoints antes de <R>"
+        return False, resp, f"resposta inesperada: {resp}"
+    if wait_auto_eq:
+        time.sleep(START_GRACE_S)
+    return True, resp, "navegação iniciada"
+
+
+def stop(ser):
+    return cmd_and_wait(ser, "C")
+
 def main():
     ap = argparse.ArgumentParser(
         description="Gera trajetoria por decomposicao em celulas (grid) "
@@ -853,7 +981,17 @@ def main():
     ap.add_argument("--max-iter", type=int, default=5000)
     ap.add_argument("--saida", default="trajetoria.json")
     ap.add_argument("--figura", default="trajetoria.png")
+    ap.add_argument("--port", default=DEFAULT_PORT, help="Porta serial utilizada para a comunicação com a placa")
+    ap.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="Baudrate utilizado  para a comunicação com a placa")
+
     args = ap.parse_args()
+
+    try:
+        ser = connect(args.port, args.baud)
+    except serial.SerialException as e:
+        print(f"[AVISO] Não consegui abrir {args.port} @ {args.baud}: {e}")
+        print("Verifique: HC-05 emparelhado, Monitor Serial fechado, porta correta.")
+        sys.exit(1)
 
     try:
         obstaculos, limites, robo = carregar_mapa(args.mapa)
@@ -953,6 +1091,11 @@ def main():
     except ImportError:
         print("[AVISO] matplotlib indisponivel; figura nao gerada")
 
+    
+    if sucesso:
+        for setpoint in caminho[1:]:
+            add_waypoint(ser, setpoint[0], setpoint[1])
+            print(f"[INFO] Waypoint {setpoint.round(4).tolist()} adicionado!")
 
 if __name__ == "__main__":
     main()
