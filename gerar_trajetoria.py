@@ -28,11 +28,19 @@ puro.
 A trajetoria entregue tem no maximo MAX_PONTOS_TRAJETORIA pontos (10),
 contando o inicio e o objetivo -- ou seja, no maximo 9 waypoints para o
 robo, que ja esta no primeiro ponto. O limite vale para os dois metodos
-e e ajustavel por '--max-pontos'. A reducao e feita por remocao de
-vertices com teste de colisao ('limitar_pontos'): cada vertice so sai
-se o atalho que o substitui continuar em linha de visada livre, de modo
-que o caminho de 10 pontos ainda e um caminho valido, e nao uma
-aproximacao do original.
+e e ajustavel por '--max-pontos'.
+
+Quem corta e 'limitar_pontos': remove um vertice de cada vez, sempre o
+que menos altera a forma do caminho, e so aceita a remocao quando o
+atalho que substitui o vertice continua em linha de visada livre. Por
+isso a trajetoria de 10 pontos ainda e um caminho valido, e nao uma
+aproximacao do original. No outro sentido, '--min-pontos' (10) completa
+com pontos dentro dos segmentos quando o caminho sai curto demais,
+sempre mantendo os vertices, para o controlador receber setpoints bem
+distribuidos.
+
+'orientacoes' calcula o theta de cada ponto (a direcao do segmento que
+sai dele) e o grava no JSON.
 """
 
 import argparse
@@ -53,10 +61,11 @@ START_GRACE_S = 2.5
 
 STATE_NAMES = {0: "GIRAR", 1: "ANDAR", 2: "DONE"}
 
-# Numero maximo de pontos da trajetoria, contando o inicio e o objetivo.
-# O robo recebe um waypoint por ponto menos o inicio, que e a pose onde
+# Numero de pontos da trajetoria, contando o inicio e o objetivo. O
+# robo recebe um waypoint por ponto menos o inicio, que e a pose onde
 # ele ja esta: no limite, 9 waypoints.
 MAX_PONTOS_TRAJETORIA = 10
+MIN_PONTOS_TRAJETORIA = 10
 
 # ---------------------------------------------------------------- geometria
 
@@ -563,42 +572,14 @@ def suavizar_caminho(pontos, livre, origem, passo):
     return np.asarray(saida, dtype=float)
 
 
-def _total_reamostrado(distancias, passo_amostra):
-    """Quantos pontos 'reamostrar' devolve com esse espacamento."""
-    return 1 + int(sum(max(1, int(np.ceil(d / passo_amostra)))
-                       for d in distancias))
-
-
-def reamostrar(pontos, passo_amostra, maximo=None):
-    """Reamostra a poligonal com espacamento aproximadamente uniforme.
-
-    Os vertices originais sao sempre mantidos: a funcao apenas insere
-    pontos no interior de cada segmento, e nunca corta uma quina -- que
-    e justamente o que tornaria o atalho perigoso.
-
-    Com 'maximo', o espacamento e aumentado o quanto for preciso para a
-    poligonal nao passar desse numero de pontos. Se os proprios
-    vertices ja ocupam todo o orcamento, devolve so os vertices.
-    """
+def reamostrar(pontos, passo_amostra):
+    """Reamostra a poligonal com espacamento aproximadamente uniforme."""
     pontos = np.asarray(pontos, dtype=float)
-    if len(pontos) < 2 or passo_amostra <= 0.0:
+    if len(pontos) < 2:
         return pontos
-
-    distancias = np.linalg.norm(np.diff(pontos, axis=0), axis=1)
-    if maximo and maximo > 0:
-        if len(pontos) >= maximo:
-            return pontos
-        # Chute inicial: comprimento dividido pelos segmentos que cabem
-        # no orcamento. O arredondamento por segmento pode estourar o
-        # limite, entao o espacamento cresce ate caber -- o pior caso
-        # (um ponto por segmento) sempre cabe, porque os vertices cabem.
-        passo_amostra = max(passo_amostra,
-                            float(distancias.sum()) / (maximo - 1))
-        while _total_reamostrado(distancias, passo_amostra) > maximo:
-            passo_amostra *= 1.05
-
     saida = [pontos[0]]
-    for a, b, d in zip(pontos[:-1], pontos[1:], distancias):
+    for a, b in zip(pontos[:-1], pontos[1:]):
+        d = np.linalg.norm(b - a)
         n = max(1, int(np.ceil(d / passo_amostra)))
         for k in range(1, n + 1):
             saida.append(a + (b - a) * (k / n))
@@ -711,8 +692,93 @@ def limitar_pontos(pontos, maximo, visada_livre):
     return saida, len(saida) <= maximo
 
 
+def reamostrar_n(pontos, n):
+    """Reamostra a poligonal em exatamente n pontos.
+
+    Todos os vertices originais sao mantidos e os pontos que faltam
+    para chegar a n vao para dentro dos segmentos, os mais longos
+    primeiro. Manter os vertices e o que garante que o caminho
+    continua livre de colisao: amostrando so por comprimento de arco,
+    as quinas ficariam de fora, e a reta entre as duas amostras de
+    cada lado de uma quina corta o canto -- podendo entrar justamente
+    no obstaculo que a quina contornava.
+    """
+    pontos = np.asarray(pontos, dtype=float)
+    if len(pontos) < 2 or n <= len(pontos):
+        return pontos
+
+    distancias = np.linalg.norm(np.diff(pontos, axis=0), axis=1)
+    total = float(distancias.sum())
+    if total <= 0.0:
+        return pontos
+
+    # Reparticao proporcional ao comprimento de cada segmento, pelo
+    # metodo dos maiores restos, para a soma bater exatamente com o
+    # numero de pontos que faltam.
+    extras = n - len(pontos)
+    quota = extras * distancias / total
+    por_segmento = np.floor(quota).astype(int)
+    sobra = extras - int(por_segmento.sum())
+    if sobra > 0:
+        ordem = np.argsort(-(quota - por_segmento))
+        por_segmento[ordem[:sobra]] += 1
+
+    saida = [pontos[0]]
+    for a, b, k in zip(pontos[:-1], pontos[1:], por_segmento):
+        for m in range(1, k + 1):
+            saida.append(a + (b - a) * (m / (k + 1)))
+        saida.append(b)
+    return np.asarray(saida)
+
+
+def reduzir_pontos(pontos, livre, origem, passo,
+                   minimo=MIN_PONTOS_TRAJETORIA,
+                   maximo=MAX_PONTOS_TRAJETORIA):
+    """Deixa a trajetoria com um numero de waypoints entre os limites.
+
+    Acima do maximo, 'limitar_pontos' tira os vertices um a um, e so
+    aceita tirar quando o atalho que substitui o vertice continua em
+    celulas livres -- por isso a reducao nunca introduz colisao.
+    Abaixo do minimo, 'reamostrar_n' acrescenta pontos dentro dos
+    proprios segmentos ate o alvo.
+    """
+    pontos = np.asarray(pontos, dtype=float)
+
+    if maximo and len(pontos) > maximo:
+        antes = len(pontos)
+        pontos, cabe = limitar_pontos(
+            pontos, maximo,
+            lambda a, b: _visada_livre(a, b, livre, origem, passo))
+        print(f"[OK] Trajetoria reduzida de {antes} para {len(pontos)} "
+              f"waypoints (limite {maximo})")
+        if not cabe:
+            print(f"[AVISO] Nao da para descer de {len(pontos)} waypoints "
+                  f"sem cortar obstaculo")
+
+    if minimo and len(pontos) < minimo:
+        pontos = reamostrar_n(pontos, minimo)
+    return pontos
+
+
+def orientacoes(pontos, theta_final=None):
+    """Theta de cada waypoint: a direcao do segmento que sai dele.
+
+    O robo e um disco, entao a orientacao nao entra no planejamento;
+    ela e so a direcao de deslocamento que o controlador deve seguir.
+    O ultimo ponto herda a orientacao do segmento que chega nele, ou
+    'theta_final' se for dado.
+    """
+    pontos = np.asarray(pontos, dtype=float)
+    if len(pontos) < 2:
+        return np.zeros(len(pontos))
+    d = np.diff(pontos, axis=0)
+    thetas = np.arctan2(d[:, 1], d[:, 0])
+    ultimo = thetas[-1] if theta_final is None else theta_final
+    return np.concatenate([thetas, [ultimo]])
+
+
 def plan_grid(inicio, objetivo, obstaculos, limites, passo=0.01,
-              suavizar=True, reamostragem=None,
+              suavizar=True, min_pontos=MIN_PONTOS_TRAJETORIA,
               max_pontos=MAX_PONTOS_TRAJETORIA):
     """Planejamento por decomposicao em celulas e busca A*.
 
@@ -768,19 +834,9 @@ def plan_grid(inicio, objetivo, obstaculos, limites, passo=0.01,
         pontos = suavizar_caminho(pontos, livre, origem, passo)
     pontos = np.asarray(pontos, dtype=float)
 
-    if max_pontos and len(pontos) > max_pontos:
-        antes = len(pontos)
-        pontos, cabe = limitar_pontos(
-            pontos, max_pontos,
-            lambda a, b: _visada_livre(a, b, livre, origem, passo))
-        print(f"[OK] Trajetoria reduzida de {antes} para {len(pontos)} "
-              f"pontos (limite {max_pontos})")
-        if not cabe:
-            print(f"[AVISO] Nao foi possivel descer a {max_pontos} pontos "
-                  f"sem cortar obstaculo; ficaram {len(pontos)}")
-
-    if reamostragem:
-        pontos = reamostrar(pontos, reamostragem, maximo=max_pontos)
+    if max_pontos or min_pontos:
+        pontos = reduzir_pontos(pontos, livre, origem, passo,
+                                minimo=min_pontos, maximo=max_pontos)
     return pontos, True
 
 
@@ -1126,13 +1182,14 @@ def main():
                     help="[grid] lado da celula da grade [m]")
     ap.add_argument("--sem-suavizar", action="store_true",
                     help="[grid] mantem o caminho em degraus da grade")
-    ap.add_argument("--reamostragem", type=float, default=0.005,
-                    help="[grid] espacamento dos pontos da trajetoria [m]; "
-                         "0 mantem so os vertices. E aumentado "
-                         "automaticamente se nao couber em --max-pontos")
-    ap.add_argument("--max-pontos", type=int, default=MAX_PONTOS_TRAJETORIA,
-                    help=f"numero maximo de pontos da trajetoria, contando "
-                         f"o inicio e o objetivo (padrao "
+    ap.add_argument("--min-pontos", type=int,
+                    default=MIN_PONTOS_TRAJETORIA,
+                    help=f"[grid] minimo de pontos da trajetoria (padrao "
+                         f"{MIN_PONTOS_TRAJETORIA}); 0 nao completa")
+    ap.add_argument("--max-pontos", type=int,
+                    default=MAX_PONTOS_TRAJETORIA,
+                    help=f"maximo de pontos da trajetoria, contando o "
+                         f"inicio e o objetivo (padrao "
                          f"{MAX_PONTOS_TRAJETORIA}); 0 remove o limite")
     ap.add_argument("--k-attr", type=float, default=1.0)
     ap.add_argument("--k-rep", type=float, default=0.001)
@@ -1147,13 +1204,18 @@ def main():
     ap.add_argument("--max-iter", type=int, default=5000)
     ap.add_argument("--saida", default="trajetoria.json")
     ap.add_argument("--figura", default="trajetoria.png")
+    ap.add_argument("--sem-envio", action="store_true",
+                    help="so gera a trajetoria e a figura, sem abrir a "
+                         "porta serial nem enviar waypoints")
     ap.add_argument("--port", default=DEFAULT_PORT, help="Porta serial utilizada para a comunicação com a placa")
     ap.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="Baudrate utilizado  para a comunicação com a placa")
 
     args = ap.parse_args()
 
+    ser = None
     try:
-        ser = connect(args.port, args.baud)
+        if not args.sem_envio:
+            ser = connect(args.port, args.baud)
     except serial.SerialException as e:
         print(f"[AVISO] Não consegui abrir {args.port} @ {args.baud}: {e}")
         print("Verifique: HC-05 emparelhado, Monitor Serial fechado, porta correta.")
@@ -1197,13 +1259,16 @@ def main():
         print("[ERRO] --max-pontos precisa ser 0 (sem limite) ou >= 2: "
               "a trajetoria tem no minimo o inicio e o objetivo")
         return
+    if args.max_pontos and args.min_pontos > args.max_pontos:
+        print(f"[ERRO] --min-pontos ({args.min_pontos}) nao pode passar de "
+              f"--max-pontos ({args.max_pontos})")
+        return
 
     if args.metodo == "grid":
         caminho, sucesso = plan_grid(
             args.inicio, args.objetivo, expandidos, limites_c,
             passo=args.passo, suavizar=not args.sem_suavizar,
-            reamostragem=args.reamostragem or None,
-            max_pontos=args.max_pontos)
+            min_pontos=args.min_pontos, max_pontos=args.max_pontos)
     else:
         caminho, sucesso = plan_potencial(
             args.inicio, args.objetivo, expandidos,
@@ -1228,7 +1293,7 @@ def main():
     if sucesso:
         comprimento = float(np.sum(np.linalg.norm(
             np.diff(caminho, axis=0), axis=1)))
-        print(f"[OK] Objetivo alcancado: {len(caminho)} pontos, "
+        print(f"[OK] Objetivo alcancado: {len(caminho)} waypoints, "
               f"comprimento {comprimento:.4f} m")
     elif args.metodo == "grid":
         print("[AVISO] Nenhum caminho encontrado")
@@ -1236,10 +1301,15 @@ def main():
         print(f"[AVISO] Parou em {caminho[-1].round(4).tolist()} "
               f"apos {len(caminho)} passos (possivel minimo local)")
 
+    # Orientacao de cada waypoint: direcao do segmento que sai dele.
+    thetas = orientacoes(caminho)
+    theta_inicial = robo.get("theta_rad") if robo else None
+
     with open(args.saida, "w", encoding="utf-8") as f:
         json.dump({
             "inicio_xy_m": list(args.inicio),
             "objetivo_xy_m": list(args.objetivo),
+            "theta_inicial_robo_rad": theta_inicial,
             "metodo": args.metodo,
             "passo_grid_m": args.passo if args.metodo == "grid" else None,
             "sucesso": bool(sucesso),
@@ -1249,6 +1319,12 @@ def main():
             "margem_seguranca_m": args.margem,
             "raio_inflado_m": raio,
             "trajetoria_xy_m": caminho.round(5).tolist(),
+            "theta_rad": thetas.round(5).tolist(),
+            "theta_graus": np.degrees(thetas).round(2).tolist(),
+            "trajetoria_xytheta": [
+                [round(x, 5), round(y, 5), round(t, 5)]
+                for (x, y), t in zip(caminho, thetas)
+            ],
         }, f, indent=4)
     print(f"[OK] Trajetoria salva em '{args.saida}'")
 
@@ -1279,7 +1355,7 @@ def main():
         print("[AVISO] matplotlib indisponivel; figura nao gerada")
 
     
-    if sucesso:
+    if sucesso and ser is not None:
         # O primeiro ponto da trajetoria e a pose atual do robo, entao
         # nao vira waypoint.
         waypoints = caminho[1:]
