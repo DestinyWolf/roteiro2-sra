@@ -3,6 +3,8 @@ import numpy as np
 import json
 import glob
 import re
+import os
+import math
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
 import argparse
@@ -14,6 +16,8 @@ import argparse
 class ConfigMapa:
     # Dimensões reais da mesa no sistema métrico (altere para o tamanho real medido)
     # Se quiser tratar como um quadrado perfeito de 1x1m, basta usar 1.0 e 1.0
+    # OBS: se existir um arquivo de calibração (tabuleiro), estes valores são
+    #      substituídos pelas dimensões medidas automaticamente pela fita preta.
     largura_mesa_m: float = 1.20   # Eixo X em metros
     altura_mesa_m: float = 0.80    # Eixo Y em metros
     largura_camera_px: int = 1280
@@ -51,6 +55,18 @@ class ConfigMapa:
     hsv_v_min: int = 80
     area_min_robo_m2: float = 0.0004   # Área mínima do marcador (ex: 2cm x 2cm = 0.0004 m²)
     margem_exclusao_robo: float = 0.09 # Raio extra (em metros) para apagar o robô da máscara de obstáculos
+
+    # --- Calibração métrica (tabuleiro) + mesa delimitada por fita preta ---
+    # Preenchidos automaticamente ao carregar o arquivo de calibração (não edite à mão)
+    cantos_calibrados: Optional[List[List[float]]] = None  # 4 cantos (virtuais) do retângulo envolvente da mesa, em px da foto
+    contorno_mesa_px: Optional[List[List[float]]] = None   # Contorno interno da fita preta, em px da foto original
+
+    # Parâmetros da detecção da fita preta
+    limiar_fita_v: int = 60            # Pixels com V (HSV) abaixo disso são considerados "fita preta"
+    fechamento_fita_m: float = 0.01    # Fecha falhas/reflexos na fita de até ~1 cm
+    area_min_mesa_m2: float = 0.10     # Área mínima aceitável para o interior da mesa
+    limite_busca_mesa_m: float = 2.5   # Distância máxima (a partir do tabuleiro) em que a mesa é procurada
+    max_lado_canvas_px: int = 3000     # Limite de resolução da imagem usada na busca da fita
 
 
 # ==============================================================================
@@ -140,12 +156,292 @@ def detectar_mesa_auto(imagem: np.ndarray) -> np.ndarray:
 
 
 # ==============================================================================
+# 2B. CALIBRAÇÃO MÉTRICA COM TABULEIRO + DETECÇÃO DA MESA PELA FITA PRETA
+# ==============================================================================
+# Ideia geral:
+#   1. O tabuleiro (de quadrados com lado conhecido) está sobre o tampo da mesa.
+#      Com os cantos internos detectados, calcula-se uma homografia
+#      "pixel da foto -> metros no plano da mesa". Como TODO o tampo está no
+#      mesmo plano, essa homografia vale para a mesa inteira, mesmo que o
+#      tabuleiro ocupe só uma parte dela.
+#   2. A foto é retificada para uma vista de topo métrica e a fita preta é
+#      segmentada. O interior da fita (região clara fechada que contém o
+#      tabuleiro) é o espaço de trabalho -> contorno em formato de "estádio".
+#   3. Calcula-se o retângulo envolvente mínimo do contorno: ele define o
+#      sistema de coordenadas (X = lado comprido) e as dimensões da mesa.
+#      Os 4 cantos desse retângulo (projetados de volta na foto) são usados
+#      pela retificação normal do programa.
+# IMPORTANTE: a câmera NÃO pode se mover entre a calibração e o mapeamento.
+
+def aplicar_homografia(pontos, H: np.ndarray) -> np.ndarray:
+    """Aplica a homografia H a uma lista de pontos (N x 2)."""
+    pts = np.asarray(pontos, dtype=np.float64).reshape(-1, 1, 2)
+    return cv2.perspectiveTransform(pts, H).reshape(-1, 2)
+
+
+def detectar_tabuleiro(imagem: np.ndarray, quadrados_x: int, quadrados_y: int):
+    """
+    Detecta os cantos internos do tabuleiro quadriculado.
+    quadrados_x / quadrados_y = número de QUADRADOS em cada direção
+    (o número de cantos internos é quadrados - 1).
+    Retorna (padrao_cantos_internos, cantos_px (N x 2)).
+    """
+    cinza = cv2.cvtColor(imagem, cv2.COLOR_BGR2GRAY)
+    tentativas = [(quadrados_x - 1, quadrados_y - 1), (quadrados_y - 1, quadrados_x - 1)]
+
+    for padrao in tentativas:
+        ok, cantos = False, None
+        if hasattr(cv2, "findChessboardCornersSB"):
+            ok, cantos = cv2.findChessboardCornersSB(
+                cinza, padrao, cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_ACCURACY
+            )
+        if not ok:
+            ok, cantos = cv2.findChessboardCorners(
+                cinza, padrao, cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
+            )
+            if ok:
+                criterio = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 1e-3)
+                cantos = cv2.cornerSubPix(cinza, cantos, (11, 11), (-1, -1), criterio)
+        if ok:
+            return padrao, cantos.reshape(-1, 2).astype(np.float32)
+
+    raise RuntimeError(
+        f"Tabuleiro de {quadrados_x}x{quadrados_y} quadrados não encontrado na imagem. "
+        "Confira a contagem de QUADRADOS, a iluminação (sem reflexos) e se ele está inteiro na foto."
+    )
+
+
+def detectar_interior_fita(
+    vista_topo: np.ndarray,
+    mascara_valida: np.ndarray,
+    ponto_interno_px: Optional[Tuple[float, float]],
+    ppm: float,
+    cfg: ConfigMapa
+) -> Optional[np.ndarray]:
+    """
+    Na vista de topo métrica, segmenta a fita preta e devolve o contorno da
+    região clara delimitada por ela (interior da mesa), em pixels da vista de topo.
+    """
+    alt, larg = vista_topo.shape[:2]
+    hsv = cv2.cvtColor(cv2.GaussianBlur(vista_topo, (5, 5), 0), cv2.COLOR_BGR2HSV)
+
+    # "Escuro" = fita preta (ou região fora da foto)
+    escuro = np.where(hsv[:, :, 2] < cfg.limiar_fita_v, 255, 0).astype(np.uint8)
+    escuro[mascara_valida == 0] = 255
+
+    # Fecha pequenas falhas na fita (reflexos, emendas)
+    k = max(3, int(round(cfg.fechamento_fita_m * ppm)) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    escuro = cv2.morphologyEx(escuro, cv2.MORPH_CLOSE, kernel)
+
+    livre = cv2.bitwise_not(escuro)
+    n, rotulos, stats, _ = cv2.connectedComponentsWithStats(livre, connectivity=4)
+
+    invalido_dil = cv2.dilate((mascara_valida == 0).astype(np.uint8), np.ones((5, 5), np.uint8))
+    area_min_px = cfg.area_min_mesa_m2 * ppm ** 2
+    ordem = sorted(range(1, n), key=lambda i: stats[i, cv2.CC_STAT_AREA], reverse=True)
+
+    reserva = None
+    candidatos = []
+    for i in ordem:
+        x, y, w, h, area = stats[i]
+        if area < area_min_px:
+            break
+        # O interior da fita é fechado: não pode encostar na borda da imagem
+        if x <= 0 or y <= 0 or x + w >= larg or y + h >= alt:
+            continue
+        comp = (rotulos == i).astype(np.uint8)
+        if np.any(comp & invalido_dil):
+            continue
+
+        contornos, _ = cv2.findContours(comp * 255, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        c = max(contornos, key=cv2.contourArea)
+
+        if ponto_interno_px is None:
+            return c
+        if cv2.pointPolygonTest(c, (float(ponto_interno_px[0]), float(ponto_interno_px[1])), False) >= 0:
+            candidatos.append(c)
+        elif reserva is None:
+            reserva = c
+
+    # Regiões "em anel" (ex: chão em volta da mesa) também contêm o tabuleiro quando
+    # preenchidas; a mesa é a região MAIS INTERNA (menor área preenchida).
+    if candidatos:
+        return min(candidatos, key=cv2.contourArea)
+
+    if reserva is not None:
+        print("[AVISO] Região delimitada pela fita encontrada, mas ela não contém o tabuleiro. Confira o resultado!")
+    return reserva
+
+
+def calibrar_com_tabuleiro(
+    imagem: np.ndarray,
+    quadrados_x: int,
+    quadrados_y: int,
+    lado_quadrado_m: float,
+    cfg: ConfigMapa
+) -> Optional[Dict]:
+    """
+    Executa a calibração completa (escala métrica + detecção da mesa pela fita).
+    Retorna o dicionário a ser salvo em JSON, ou None se o usuário cancelar.
+    """
+    h_img, w_img = imagem.shape[:2]
+
+    # --- 1. Tabuleiro -> homografia foto(px) -> plano da mesa(m) ---
+    padrao, cantos_px = detectar_tabuleiro(imagem, quadrados_x, quadrados_y)
+    obj_m = np.array(
+        [[i * lado_quadrado_m, j * lado_quadrado_m] for j in range(padrao[1]) for i in range(padrao[0])],
+        dtype=np.float64
+    )
+    H, _ = cv2.findHomography(cantos_px.astype(np.float64), obj_m, 0)
+    if H is None:
+        raise RuntimeError("Falha ao calcular a homografia do tabuleiro.")
+    H_inv = np.linalg.inv(H)
+
+    erros = np.linalg.norm(aplicar_homografia(cantos_px, H) - obj_m, axis=1)
+    print(f"[CALIB] Tabuleiro: {padrao[0]}x{padrao[1]} cantos internos | "
+          f"erro médio = {erros.mean() * 1000:.2f} mm | máx = {erros.max() * 1000:.2f} mm")
+
+    # --- 2. Vista de topo métrica ao redor do tabuleiro ---
+    centro_tab_m = obj_m.mean(axis=0)
+    cantos_foto_m = aplicar_homografia([[0, 0], [w_img - 1, 0], [w_img - 1, h_img - 1], [0, h_img - 1]], H)
+    lim = cfg.limite_busca_mesa_m
+    xmin = max(cantos_foto_m[:, 0].min(), centro_tab_m[0] - lim)
+    xmax = min(cantos_foto_m[:, 0].max(), centro_tab_m[0] + lim)
+    ymin = max(cantos_foto_m[:, 1].min(), centro_tab_m[1] - lim)
+    ymax = min(cantos_foto_m[:, 1].max(), centro_tab_m[1] + lim)
+    if xmin >= xmax or ymin >= ymax:
+        xmin, xmax = centro_tab_m[0] - lim, centro_tab_m[0] + lim
+        ymin, ymax = centro_tab_m[1] - lim, centro_tab_m[1] + lim
+
+    ppm = min(float(cfg.pixels_por_metro), cfg.max_lado_canvas_px / max(xmax - xmin, ymax - ymin))
+    A = np.array([[ppm, 0, -ppm * xmin], [0, ppm, -ppm * ymin], [0, 0, 1]], dtype=np.float64)
+    tam = (int(math.ceil((xmax - xmin) * ppm)), int(math.ceil((ymax - ymin) * ppm)))
+
+    vista_topo = cv2.warpPerspective(imagem, A @ H, tam)
+    valida = cv2.warpPerspective(np.full((h_img, w_img), 255, np.uint8), A @ H, tam, flags=cv2.INTER_NEAREST)
+
+    # --- 3. Interior da fita preta (deve conter o tabuleiro) ---
+    centro_tab_px = aplicar_homografia([centro_tab_m], A)[0]
+    contorno = detectar_interior_fita(vista_topo, valida, centro_tab_px, ppm, cfg)
+    if contorno is None:
+        cv2.namedWindow("Vista de topo (fita NAO encontrada)", cv2.WINDOW_NORMAL)
+        cv2.imshow("Vista de topo (fita NAO encontrada)", vista_topo)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        raise RuntimeError(
+            "Não foi possível encontrar a região fechada pela fita preta. "
+            "Tente ajustar --limiar-fita (ex: 80 ou 100) e verifique se a mesa inteira aparece na foto."
+        )
+
+    # Simplifica o contorno (tolerância de ~2 mm) mantendo a forma das curvas
+    contorno = cv2.approxPolyDP(contorno, 0.002 * ppm, True).reshape(-1, 2).astype(np.float64)
+    contorno_m = contorno / ppm + np.array([xmin, ymin])          # metros (referencial do tabuleiro)
+    contorno_foto_px = aplicar_homografia(contorno_m, H_inv)       # pixels da foto original
+
+    # --- 4. Referencial da mesa: retângulo envolvente mínimo (X = lado comprido) ---
+    rect = cv2.minAreaRect(contorno_m.astype(np.float32))
+    caixa = cv2.boxPoints(rect).astype(np.float64)
+    e1, e2 = caixa[1] - caixa[0], caixa[2] - caixa[1]
+    u, v = (e1, e2) if np.linalg.norm(e1) >= np.linalg.norm(e2) else (e2, e1)
+    comprimento_m, largura_m = float(np.linalg.norm(u)), float(np.linalg.norm(v))
+    centro = caixa.mean(axis=0)
+
+    def direcao_na_foto(vetor):
+        p = aplicar_homografia([centro, centro + vetor / np.linalg.norm(vetor) * 0.01], H_inv)
+        return p[1] - p[0]
+
+    # X da mesa apontando para a direita da foto e sem espelhamento da imagem
+    du = direcao_na_foto(u)
+    if du[0] < 0:
+        u, du = -u, -du
+    dv = direcao_na_foto(v)
+    if du[0] * dv[1] - du[1] * dv[0] < 0:
+        v = -v
+
+    cantos_m = np.array([
+        centro - u / 2 - v / 2,   # Topo-Esquerda
+        centro + u / 2 - v / 2,   # Topo-Direita
+        centro + u / 2 + v / 2,   # Base-Direita
+        centro - u / 2 + v / 2,   # Base-Esquerda
+    ])
+    cantos_foto = aplicar_homografia(cantos_m, H_inv)
+
+    print(f"[CALIB] Mesa (interior da fita): {comprimento_m * 100:.1f} cm x {largura_m * 100:.1f} cm "
+          f"| área = {cv2.contourArea(contorno_m.astype(np.float32)) * 1e4:.0f} cm²")
+    print(f"[CALIB] Raio das pontas (se forem semicírculos) ~ {largura_m * 50:.1f} cm")
+
+    calib = {
+        "resolucao_px": [w_img, h_img],
+        "tabuleiro": {
+            "quadrados": [quadrados_x, quadrados_y],
+            "lado_quadrado_m": lado_quadrado_m,
+            "erro_medio_mm": round(float(erros.mean() * 1000), 3),
+        },
+        "largura_mesa_m": round(comprimento_m, 4),
+        "altura_mesa_m": round(largura_m, 4),
+        "cantos_img_px": np.round(cantos_foto, 3).tolist(),
+        "contorno_mesa_px": np.round(contorno_foto_px, 3).tolist(),
+    }
+
+    # --- 5. Conferência visual ---
+    debug = imagem.copy()
+    cv2.drawChessboardCorners(debug, padrao, cantos_px.reshape(-1, 1, 2), True)
+    cv2.polylines(debug, [np.round(contorno_foto_px).astype(np.int32)], True, (255, 0, 255), 2)
+    cv2.polylines(debug, [np.round(cantos_foto).astype(np.int32)], True, (0, 255, 255), 1)
+
+    cfg_tmp = ConfigMapa(**{**cfg.__dict__, "largura_mesa_m": comprimento_m, "altura_mesa_m": largura_m})
+    cantos_f32 = cantos_foto.astype(np.float32)
+    retificada = retificar_mesa(imagem, cantos_f32, cfg_tmp)
+    contorno_ret = aplicar_homografia(contorno_foto_px, matriz_retificacao(cantos_f32, cfg_tmp))
+    cv2.polylines(retificada, [np.round(contorno_ret).astype(np.int32)], True, (255, 0, 255), 2)
+    cv2.putText(retificada, f"{comprimento_m * 100:.1f} x {largura_m * 100:.1f} cm", (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+    cv2.namedWindow("Calibracao: tabuleiro e fita", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("Calibracao: mesa retificada", cv2.WINDOW_NORMAL)
+    cv2.imshow("Calibracao: tabuleiro e fita", debug)
+    cv2.imshow("Calibracao: mesa retificada", retificada)
+    print("\n[INSTRUÇÃO] Confira as janelas. Qualquer tecla = SALVAR | ESC = descartar.")
+    tecla = cv2.waitKey(0) & 0xFF
+    cv2.destroyAllWindows()
+
+    if tecla == 27:
+        print("[CALIB] Calibração descartada.")
+        return None
+    return calib
+
+
+def salvar_calibracao(calib: Dict, caminho: str):
+    with open(caminho, "w", encoding="utf-8") as f:
+        json.dump(calib, f, indent=4)
+    print(f"[OK] Calibração salva em '{caminho}'")
+
+
+def carregar_calibracao(caminho: str, cfg: ConfigMapa) -> bool:
+    """Lê o arquivo de calibração e preenche a configuração. Retorna True se carregou."""
+    if not os.path.exists(caminho):
+        return False
+    with open(caminho, "r", encoding="utf-8") as f:
+        calib = json.load(f)
+
+    cfg.largura_mesa_m = float(calib["largura_mesa_m"])
+    cfg.altura_mesa_m = float(calib["altura_mesa_m"])
+    cfg.cantos_calibrados = calib["cantos_img_px"]
+    cfg.contorno_mesa_px = calib.get("contorno_mesa_px")
+    cfg.largura_camera_px, cfg.altura_camera_px = calib.get(
+        "resolucao_px", [cfg.largura_camera_px, cfg.altura_camera_px]
+    )
+    print(f"[INFO] Calibração carregada de '{caminho}': mesa de "
+          f"{cfg.largura_mesa_m * 100:.1f} cm x {cfg.altura_mesa_m * 100:.1f} cm")
+    return True
+
+
+# ==============================================================================
 # 3. RETIFICAÇÃO, DETECÇÃO DO ROBÔ (HSV) E EXTRAÇÃO DOS POLÍGONOS
 # ==============================================================================
-def retificar_mesa(imagem: np.ndarray, cantos_mesa: np.ndarray, cfg: ConfigMapa) -> np.ndarray:
-    """
-    Aplica Homografia para recortar apenas a mesa e deixá-la na proporção métrica exata.
-    """
+def matriz_retificacao(cantos_mesa: np.ndarray, cfg: ConfigMapa) -> np.ndarray:
+    """Matriz de homografia: pixels da foto original -> pixels da mesa retificada."""
     largura_px = int(cfg.largura_mesa_m * cfg.pixels_por_metro)
     altura_px = int(cfg.altura_mesa_m * cfg.pixels_por_metro)
 
@@ -156,7 +452,17 @@ def retificar_mesa(imagem: np.ndarray, cantos_mesa: np.ndarray, cfg: ConfigMapa)
         [0, altura_px - 1]
     ], dtype="float32")
 
-    matriz_H = cv2.getPerspectiveTransform(cantos_mesa, destino)
+    return cv2.getPerspectiveTransform(cantos_mesa.astype("float32"), destino)
+
+
+def retificar_mesa(imagem: np.ndarray, cantos_mesa: np.ndarray, cfg: ConfigMapa) -> np.ndarray:
+    """
+    Aplica Homografia para recortar apenas a mesa e deixá-la na proporção métrica exata.
+    """
+    largura_px = int(cfg.largura_mesa_m * cfg.pixels_por_metro)
+    altura_px = int(cfg.altura_mesa_m * cfg.pixels_por_metro)
+
+    matriz_H = matriz_retificacao(cantos_mesa, cfg)
     mesa_retificada = cv2.warpPerspective(imagem, matriz_H, (largura_px, altura_px))
     return mesa_retificada
 
@@ -171,7 +477,11 @@ def pixel_para_metro(x_px: float, y_px: float, altura_px: int, cfg: ConfigMapa) 
     return round(float(x_m), 4), round(float(y_m), 4)
 
 
-def detectar_robo_hsv(mesa_img: np.ndarray, cfg: ConfigMapa) -> Tuple[Optional[Dict], np.ndarray]:
+def detectar_robo_hsv(
+    mesa_img: np.ndarray,
+    cfg: ConfigMapa,
+    mascara_mesa: Optional[np.ndarray] = None
+) -> Tuple[Optional[Dict], np.ndarray]:
     """
     Localiza o marcador vermelho/laranja do robô na imagem retificada da mesa.
     Retorna:
@@ -193,6 +503,10 @@ def detectar_robo_hsv(mesa_img: np.ndarray, cfg: ConfigMapa) -> Tuple[Optional[D
     mascara2 = cv2.inRange(imagem_hsv, limite_inferior2, limite_superior2)
 
     mascara_robo = cv2.bitwise_or(mascara1, mascara2)
+
+    # Considera apenas o que está dentro da fita (ignora o chão nas pontas arredondadas)
+    if mascara_mesa is not None:
+        mascara_robo = cv2.bitwise_and(mascara_robo, mascara_mesa)
 
     # Limpeza morfológica para eliminar ruídos pontuais
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -257,10 +571,12 @@ def extrair_obstaculos_poligonais(
     mesa_img: np.ndarray,
     cfg: ConfigMapa,
     mascara_exclusao_robo: Optional[np.ndarray] = None,
-    dados_robo: Optional[Dict] = None
+    dados_robo: Optional[Dict] = None,
+    mascara_mesa: Optional[np.ndarray] = None
 ):
     """
     Identifica os objetos sobre a mesa, extrai seus vértices e converte para metros.
+    Se 'mascara_mesa' (interior da fita preta) for informada, apenas essa região é analisada.
     Retorna:
       - lista_poligonos_m: Lista de matrizes NumPy (N x 2) com coordenadas (x, y) em metros
       - img_debug: Imagem anotada para conferência visual (obstáculos + robô)
@@ -272,15 +588,28 @@ def extrair_obstaculos_poligonais(
 
     # Limiarização de Otsu (separa fundo da mesa dos objetos automaticamente)
     tipo_thresh = cv2.THRESH_BINARY_INV if cfg.inverter_binarizacao else cv2.THRESH_BINARY
-    _, mascara = cv2.threshold(blur, 0, 255, tipo_thresh + cv2.THRESH_OTSU)
+    if mascara_mesa is not None and np.count_nonzero(mascara_mesa) > 0:
+        # Otsu calculado SOMENTE com os pixels dentro da fita (chão e fita não influenciam)
+        valores = blur[mascara_mesa > 0].reshape(-1, 1)
+        limiar_otsu, _ = cv2.threshold(valores, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, mascara = cv2.threshold(blur, limiar_otsu, 255, tipo_thresh)
+    else:
+        _, mascara = cv2.threshold(blur, 0, 255, tipo_thresh + cv2.THRESH_OTSU)
 
     # Remove a região do robô para que ele NÃO seja detectado como obstáculo
     if mascara_exclusao_robo is not None:
         mascara = cv2.bitwise_and(mascara, cv2.bitwise_not(mascara_exclusao_robo))
 
-    # Zera as bordas da imagem para evitar que rebarbas da quina da mesa virem obstáculos
     margem_px = int(cfg.margem_borda_m * cfg.pixels_por_metro)
-    if margem_px > 0:
+    if mascara_mesa is not None:
+        # Mantém só o interior da fita, recuado 'margem_borda_m' (a fita preta não vira obstáculo)
+        area_util = mascara_mesa
+        if margem_px > 0:
+            k = 2 * margem_px + 1
+            area_util = cv2.erode(mascara_mesa, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+        mascara = cv2.bitwise_and(mascara, area_util)
+    elif margem_px > 0:
+        # Zera as bordas da imagem para evitar que rebarbas da quina da mesa virem obstáculos
         mascara[:margem_px, :] = 0
         mascara[-margem_px:, :] = 0
         mascara[:, :margem_px] = 0
@@ -360,16 +689,72 @@ def extrair_obstaculos_poligonais(
 # ==============================================================================
 # 4. CAPTURA VIA WEBCAM (Iriun / USB)
 # ==============================================================================
-def capturar_frame(indice_camera: int) -> np.ndarray:
+def listar_cameras_windows() -> List[str]:
+    """Nomes das câmeras DirectShow na ordem dos índices do OpenCV (requer 'pip install pygrabber')."""
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+        return FilterGraph().get_input_devices()
+    except Exception:
+        return []
+
+
+def _abrir_camera(indice: int) -> Optional[cv2.VideoCapture]:
+    """Abre o índice e confirma que ele realmente entrega frames (o Iriun demora para começar)."""
+    for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY):
+        cap = cv2.VideoCapture(indice, backend)
+        if cap.isOpened():
+            for _ in range(30):
+                ok, frame = cap.read()
+                if ok and frame is not None and frame.size > 0:
+                    return cap
+                cv2.waitKey(100)
+        cap.release()
+    return None
+
+
+def resolver_camera(cam) -> int:
+    """
+    Converte o argumento --cam em índice numérico. Aceita:
+      - número ("0", "1", ...)  -> usado direto (ANTES era passado como texto ao OpenCV e sempre falhava)
+      - nome ("Iriun")          -> procura entre as câmeras do Windows; sem pygrabber, testa os índices 0-9
+    """
+    if isinstance(cam, int):
+        return cam
+    cam = str(cam).strip()
+    if cam.lstrip("-").isdigit():
+        return int(cam)
+
+    nomes = listar_cameras_windows()
+    for i, n in enumerate(nomes):
+        if cam.lower() in n.lower():
+            print(f"[INFO] Câmera '{n}' encontrada no índice {i}.")
+            return i
+
+    print(f"[AVISO] Não consegui localizar '{cam}' pelo nome "
+          f"({'câmeras: ' + str(nomes) if nomes else 'instale com: pip install pygrabber'}). "
+          "Testando índices 0-9...")
+    for i in range(10):
+        cap = _abrir_camera(i)
+        if cap is not None:
+            cap.release()
+            print(f"[INFO] Usando o índice {i}. Se for a câmera errada, use --cam <número>.")
+            return i
+    raise RuntimeError("Nenhuma câmera entregou imagem. Abra o app Iriun no celular e o Iriun Webcam no PC.")
+
+
+def capturar_frame(camera) -> np.ndarray:
     """
     Abre um preview ao vivo e devolve o frame congelado quando o usuário
-    pressiona ESPAÇO. ESC cancela.
+    pressiona ESPAÇO. ESC cancela. 'camera' pode ser índice ou nome.
     """
-    cap = cv2.VideoCapture(indice_camera)
-    if not cap.isOpened():
+    indice_camera = resolver_camera(camera)
+    cap = _abrir_camera(indice_camera)
+    if cap is None:
         raise RuntimeError(
-            f"Não foi possível abrir /dev/video{indice_camera}. "
-            "Verifique se o celular está transmitindo no app do Iriun."
+            f"Não foi possível abrir a câmera de índice {indice_camera} (ou ela não envia imagem). "
+            "Verifique se o Iriun está transmitindo no celular e se nenhum outro programa "
+            "(Zoom/navegador/outro Python) está usando a câmera. "
+            "Rode 'python varredura.py' para ver os índices disponíveis."
         )
 
     nome_janela = "Captura: ESPACO para congelar | ESC para cancelar"
@@ -379,8 +764,10 @@ def capturar_frame(indice_camera: int) -> np.ndarray:
     try:
         while True:
             ok, frame = cap.read()
-            if not ok:
-                raise RuntimeError("Falha ao ler frame da câmera.")
+            if not ok or frame is None:
+                if cv2.waitKey(20) & 0xFF == 27:
+                    raise RuntimeError("Captura cancelada pelo usuário.")
+                continue  # frame perdido (comum no Iriun): tenta o próximo
 
             cv2.imshow(nome_janela, frame)
             tecla = cv2.waitKey(20) & 0xFF
@@ -398,7 +785,14 @@ def capturar_frame(indice_camera: int) -> np.ndarray:
 # ==============================================================================
 def processar_mapa(imagem: np.ndarray, cfg: ConfigMapa):
     # 1. Obter os 4 cantos da mesa
-    if cfg.pontos_mesa_fixos is not None and len(cfg.pontos_mesa_fixos) == 4:
+    if cfg.cantos_calibrados is not None:
+        # Cantos vindos da calibração com tabuleiro (já ordenados, NÃO reordenar)
+        alt_img, larg_img = imagem.shape[:2]
+        if (larg_img, alt_img) != (cfg.largura_camera_px, cfg.altura_camera_px):
+            print(f"[AVISO] Resolução da foto ({larg_img}x{alt_img}) difere da calibração "
+                  f"({cfg.largura_camera_px}x{cfg.altura_camera_px}). Refaça a calibração!")
+        cantos = np.array(cfg.cantos_calibrados, dtype="float32")
+    elif cfg.pontos_mesa_fixos is not None and len(cfg.pontos_mesa_fixos) == 4:
         cantos = ordenar_4_pontos(np.array(cfg.pontos_mesa_fixos, dtype="float32"))
     elif cfg.auto_detectar_mesa:
         cantos = detectar_mesa_auto(imagem)
@@ -407,14 +801,25 @@ def processar_mapa(imagem: np.ndarray, cfg: ConfigMapa):
 
     # 2. Isolar e retificar a mesa
     mesa_retificada = retificar_mesa(imagem, cantos, cfg)
+    altura_ret_px = mesa_retificada.shape[0]
+
+    # 2b. Máscara do interior da fita preta (formato de estádio), se calibrado
+    mascara_mesa = None
+    contorno_ret_px = None
+    if cfg.contorno_mesa_px is not None:
+        contorno_ret_px = aplicar_homografia(cfg.contorno_mesa_px, matriz_retificacao(cantos, cfg))
+        mascara_mesa = np.zeros(mesa_retificada.shape[:2], np.uint8)
+        cv2.fillPoly(mascara_mesa, [np.round(contorno_ret_px).astype(np.int32)], 255)
 
     # 3. Detectar o robô (vermelho/laranja) em HSV e gerar máscara de exclusão
-    dados_robo, mascara_exclusao_robo = detectar_robo_hsv(mesa_retificada, cfg)
+    dados_robo, mascara_exclusao_robo = detectar_robo_hsv(mesa_retificada, cfg, mascara_mesa)
 
     # 4. Extrair matrizes de vértices (x, y) dos obstáculos (sem incluir o robô)
     poligonos_m, img_debug, mascara = extrair_obstaculos_poligonais(
-        mesa_retificada, cfg, mascara_exclusao_robo, dados_robo
+        mesa_retificada, cfg, mascara_exclusao_robo, dados_robo, mascara_mesa
     )
+    if contorno_ret_px is not None:
+        cv2.polylines(img_debug, [np.round(contorno_ret_px).astype(np.int32)], True, (255, 0, 255), 2)
 
     # 5. Exibir resultados no terminal e exportar JSON
     print(f"\n================ MAPA EXTRAÍDO ({cfg.largura_mesa_m}m x {cfg.altura_mesa_m}m) ================")
@@ -449,6 +854,12 @@ def processar_mapa(imagem: np.ndarray, cfg: ConfigMapa):
         "obstaculos": []
     }
 
+    # Contorno real da mesa (interior da fita, formato de estádio) em metros
+    if contorno_ret_px is not None:
+        dados_exportacao["workspace_contorno_xy_m"] = [
+            list(pixel_para_metro(x, y, altura_ret_px, cfg)) for x, y in contorno_ret_px
+        ]
+
     for i, poly in enumerate(poligonos_m):
         print(f"Obstáculo {i+1} (Matriz {poly.shape[0]}x2 em metros):")
         print(poly)
@@ -482,10 +893,23 @@ if __name__ == "__main__":
     parser.add_argument('--cam', help="captura da webcam buscando o device pelo nome", type=str,
                         nargs="?", const="Iriun", metavar="NOME")
 
+    # --- Calibração com tabuleiro quadriculado ---
+    parser.add_argument('--calibrar', action='store_true',
+                        help="modo calibração: foto com o tabuleiro SOZINHO sobre a mesa")
+    parser.add_argument('--tab', type=int, nargs=2, metavar=("QX", "QY"),
+                        help="número de QUADRADOS do tabuleiro em cada direção (ex: --tab 9 7)")
+    parser.add_argument('--lado', type=float, help="lado de cada quadrado do tabuleiro em metros (ex: 0.025)")
+    parser.add_argument('--calib-arq', default="calibracao_mesa.json", help="arquivo de calibração")
+    parser.add_argument('--sem-calib', action='store_true', help="ignora o arquivo de calibração existente")
+    parser.add_argument('--limiar-fita', type=int, default=60,
+                        help="brilho (V do HSV, 0-255) máximo da fita preta (padrão 60)")
+
     args = parser.parse_args()
 
     if not args.img and not args.cam:
         parser.error("informe o caminho de uma imagem ou use --cam")
+    if args.calibrar and (not args.tab or not args.lado):
+        parser.error("a calibração exige --tab QX QY e --lado (em metros)")
 
     ad = True if (args.ac.lower() == 's' or args.ac.lower() == 'y') else False
     ib = True if (args.ib.lower() == 's' or args.ib.lower() == 'y') else False
@@ -495,7 +919,8 @@ if __name__ == "__main__":
         largura_mesa_m=args.larg,          # Altere para a largura real (ou 1.0 se quiser normalizar como quadrado)
         altura_mesa_m=args.altu,           # Altere para a profundidade real (ou 1.0 se quiser normalizar como quadrado)
         auto_detectar_mesa=ad,             # False = abre a janela para clicar nos 4 cantos da mesa
-        inverter_binarizacao=ib            # Mude para True se a mesa for clara e os objetos escuros
+        inverter_binarizacao=ib,           # Mude para True se a mesa for clara e os objetos escuros
+        limiar_fita_v=args.limiar_fita
     )
     
     if args.cam:
@@ -505,4 +930,11 @@ if __name__ == "__main__":
         if imagem_entrada is None:
             raise FileNotFoundError(f"Não foi possível carregar a imagem: {args.img}")
 
-    processar_mapa(imagem_entrada, config)
+    if args.calibrar:
+        calibracao = calibrar_com_tabuleiro(imagem_entrada, args.tab[0], args.tab[1], args.lado, config)
+        if calibracao is not None:
+            salvar_calibracao(calibracao, args.calib_arq)
+    else:
+        if not args.sem_calib and carregar_calibracao(args.calib_arq, config):
+            print("[INFO] -larg/-altu e --ac ignorados (usando dimensões e cantos da calibração).")
+        processar_mapa(imagem_entrada, config)
