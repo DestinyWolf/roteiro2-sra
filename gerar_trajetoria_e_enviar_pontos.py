@@ -361,8 +361,8 @@ def cmd_and_wait(ser, cmd, timeout=RESPONSE_TIMEOUT_S):
 # ---------------------------------------------------------------------------
 # Waypoints
 # ---------------------------------------------------------------------------
-def add_waypoint(ser, x, y):
-    return cmd_and_wait(ser, f"A,{x:.3f},{y:.3f}")
+def add_waypoint(ser, x, y,theta):
+    return cmd_and_wait(ser, f"A,{x:.3f},{y:.3f},{theta:.3f}")
 
 
 def set_waypoints(ser, pts):
@@ -486,7 +486,7 @@ def main():
     
     if sucesso:
         for setpoint in caminho[1:]:
-            add_waypoint(ser, setpoint[0], setpoint[1])
+            add_waypoint(ser, setpoint[0], setpoint[1], setpoint[2])
             print(f"[INFO] Waypoint {setpoint.round(4).tolist()} adicionado!")
 
 if __name__ == "__main__":
