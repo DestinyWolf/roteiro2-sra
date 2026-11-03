@@ -23,8 +23,8 @@ import argparse
 import serial
 import serial.tools.list_ports
 
-DEFAULT_PORT = "COM11"
-DEFAULT_BAUD = 115200
+DEFAULT_PORT = "COM9"
+DEFAULT_BAUD = 57600
 TIMEOUT_S = 1.0
 RESPONSE_TIMEOUT_S = 2.0
 AUTO_EQ_S = 2.0

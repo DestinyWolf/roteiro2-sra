@@ -35,8 +35,8 @@ import serial.tools.list_ports
 import sys
 import time
 
-DEFAULT_PORT = "COM11"
-DEFAULT_BAUD = 115200
+DEFAULT_PORT = "COM9"
+DEFAULT_BAUD = 57600
 TIMEOUT_S = 1.0
 RESPONSE_TIMEOUT_S = 2.0
 AUTO_EQ_S = 2.0
@@ -941,6 +941,9 @@ def start(ser, wait_auto_eq=True):
         time.sleep(START_GRACE_S)
     return True, resp, "navegação iniciada"
 
+def set_pose(ser, x, y, th):
+    return cmd_and_wait(ser, f"O,{x:.3f},{y:.3f},{th:.1f}")
+
 
 def stop(ser):
     return cmd_and_wait(ser, "C")
@@ -1093,9 +1096,11 @@ def main():
 
     
     if sucesso:
+        set_pose(ser, robo.get("x_m"), robo.get("y_m"), robo.get("theta_rad"))
         for setpoint in caminho[1:]:
             add_waypoint(ser, setpoint[0], setpoint[1], setpoint[2])
             print(f"[INFO] Waypoint {setpoint.round(4).tolist()} adicionado!")
+        start(ser)
 
 if __name__ == "__main__":
     main()
