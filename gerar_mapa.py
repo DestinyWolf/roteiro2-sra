@@ -360,33 +360,6 @@ def extrair_obstaculos_poligonais(
 # ==============================================================================
 # 4. CAPTURA VIA WEBCAM (Iriun / USB)
 # ==============================================================================
-def localizar_camera_por_nome(nome_busca: str) -> int:
-    """
-    Procura em /sys/class/video4linux um device cujo nome contenha 'nome_busca'
-    e retorna seu índice (ex: 2 para /dev/video2).
-    """
-    candidatos = []
-    for caminho_nome in sorted(glob.glob("/sys/class/video4linux/video*/name")):
-        try:
-            with open(caminho_nome, encoding="utf-8") as f:
-                nome_device = f.read().strip()
-        except OSError:
-            continue
-        if nome_busca.lower() in nome_device.lower():
-            indice = int(re.search(r"/video(\d+)/name$", caminho_nome).group(1))
-            candidatos.append((indice, nome_device))
-
-    if not candidatos:
-        raise RuntimeError(
-            f"Nenhuma câmera com '{nome_busca}' no nome foi encontrada. "
-            "Abra o app 'iriunwebcam' no PC e conecte o celular antes de rodar."
-        )
-
-    indice, nome_device = candidatos[0]
-    print(f"[INFO] Câmera encontrada: /dev/video{indice} ({nome_device})")
-    return indice
-
-
 def capturar_frame(indice_camera: int) -> np.ndarray:
     """
     Abre um preview ao vivo e devolve o frame congelado quando o usuário
@@ -526,7 +499,7 @@ if __name__ == "__main__":
     )
     
     if args.cam:
-        imagem_entrada = capturar_frame(localizar_camera_por_nome(args.cam))
+        imagem_entrada = capturar_frame(args.cam)
     else:
         imagem_entrada = cv2.imread(args.img)
         if imagem_entrada is None:
