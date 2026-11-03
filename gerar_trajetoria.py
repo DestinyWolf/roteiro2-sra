@@ -40,7 +40,18 @@ sempre mantendo os vertices, para o controlador receber setpoints bem
 distribuidos.
 
 'orientacoes' calcula o theta de cada ponto (a direcao do segmento que
-sai dele) e o grava no JSON.
+sai dele), grava no JSON e manda para a placa.
+
+No fim, 'enviar_trajetoria' carrega o caminho no robo, na ordem
+<O> (sincroniza a pose medida pela camera com a odometria da placa),
+<W> (a lista de waypoints inteira num comando so) e <L> (confere o que
+a placa guardou). O <R>, que poe o robo em movimento, so sai com
+'--iniciar'. O protocolo -- tres campos por waypoint, angulo em graus
+-- esta documentado no cabecalho de 'demo.py'.
+
+A porta serial e aberta depois de a trajetoria e a figura estarem
+salvas, para o planejamento nao se perder junto se o Bluetooth falhar,
+e e fechada num 'finally'. '--sem-envio' pula essa etapa inteira.
 """
 
 import argparse
@@ -52,7 +63,9 @@ import serial.tools.list_ports
 import sys
 import time
 
-DEFAULT_PORT = "COM11"
+# A placa aparece como porta COM no Windows e como rfcomm (HC-05
+# pareado via Bluetooth) no Linux.
+DEFAULT_PORT = "COM11" if sys.platform.startswith("win") else "/dev/rfcomm0"
 DEFAULT_BAUD = 115200
 TIMEOUT_S = 1.0
 RESPONSE_TIMEOUT_S = 2.0
@@ -1100,16 +1113,31 @@ def cmd_and_wait(ser, cmd, timeout=RESPONSE_TIMEOUT_S):
 # ---------------------------------------------------------------------------
 # Waypoints
 # ---------------------------------------------------------------------------
-def add_waypoint(ser, x, y):
-    return cmd_and_wait(ser, f"A,{x:.3f},{y:.3f}")
+# O firmware espera tres campos por waypoint -- x, y e theta -- e
+# trabalha com o angulo em GRAUS (e assim que ele volta na telemetria
+# <T,x,y,th,...>). O protocolo esta documentado no cabecalho de
+# 'demo.py', que e a referencia usada aqui.
+
+def _ok(resp):
+    """Verdadeiro se a placa confirmou o comando."""
+    return resp is not None and resp.startswith("<OK")
+
+
+def add_waypoint(ser, x, y, th_graus):
+    return cmd_and_wait(ser, f"A,{x:.3f},{y:.3f},{th_graus:.1f}")
 
 
 def set_waypoints(ser, pts):
+    """Substitui a lista inteira num comando so (<W>).
+
+    Um <W> vale por N <A>: uma ida e volta em vez de N, o que importa
+    num enlace Bluetooth com timeout de 2 s por comando.
+    """
     if not pts:
         return cmd_and_wait(ser, "C")
     body = f"W,{len(pts)}"
-    for (x, y) in pts:
-        body += f",{x:.3f},{y:.3f}"
+    for (x, y, th) in pts:
+        body += f",{x:.3f},{y:.3f},{th:.1f}"
     return cmd_and_wait(ser, body)
 
 
@@ -1117,8 +1145,8 @@ def append_waypoints(ser, pts):
     if not pts:
         return None
     body = f"Q,{len(pts)}"
-    for (x, y) in pts:
-        body += f",{x:.3f},{y:.3f}"
+    for (x, y, th) in pts:
+        body += f",{x:.3f},{y:.3f},{th:.1f}"
     return cmd_and_wait(ser, body)
 
 
@@ -1130,9 +1158,10 @@ def list_waypoints(ser):
     n = int(parts[0])
     wps = []
     for i in range(n):
-        x = float(parts[1 + 2 * i])
-        y = float(parts[2 + 2 * i])
-        wps.append((x, y))
+        x = float(parts[1 + 3 * i])
+        y = float(parts[2 + 3 * i])
+        th = float(parts[3 + 3 * i])
+        wps.append((x, y, th))
     return wps
 
 
@@ -1140,8 +1169,13 @@ def delete_waypoint(ser, idx):
     return cmd_and_wait(ser, f"D,{idx}")
 
 
-def replace_waypoint(ser, idx, x, y):
-    return cmd_and_wait(ser, f"S,{idx},{x:.3f},{y:.3f}")
+def replace_waypoint(ser, idx, x, y, th_graus):
+    return cmd_and_wait(ser, f"S,{idx},{x:.3f},{y:.3f},{th_graus:.1f}")
+
+
+def set_pose(ser, x, y, th_graus):
+    """<O>: diz a placa onde ela esta, no referencial da mesa."""
+    return cmd_and_wait(ser, f"O,{x:.3f},{y:.3f},{th_graus:.1f}")
 
 # ---------------------------------------------------------------------------
 # Execução
@@ -1161,6 +1195,68 @@ def start(ser, wait_auto_eq=True):
 
 def stop(ser):
     return cmd_and_wait(ser, "C")
+
+
+def enviar_trajetoria(ser, caminho, thetas, pose=None, iniciar=False):
+    """Carrega a trajetoria na placa e, opcionalmente, manda navegar.
+
+    A ordem importa:
+
+    1. <O,x,y,th> alinha a odometria da placa com a pose que a camera
+       mediu. Os waypoints estao no referencial da mesa; se a placa
+       achar que esta em outro lugar, o caminho inteiro sai deslocado e
+       girado -- planejar certo nao adianta nada.
+    2. <W,n,...> substitui a lista de waypoints num comando so.
+    3. <R> so sai se 'iniciar' for pedido, porque e ele que poe o robo
+       em movimento.
+
+    O primeiro ponto do caminho e a pose atual do robo, entao nao vira
+    waypoint. Devolve True se tudo foi confirmado pela placa.
+    """
+    if pose is not None:
+        x, y, th = pose
+        resp = set_pose(ser, x, y, th)
+        if not _ok(resp):
+            print(f"[ERRO] A placa nao aceitou a pose <O>: {resp}")
+            return False
+        print(f"[OK] Pose sincronizada: x={x:.3f} y={y:.3f} "
+              f"theta={th:.1f} graus")
+
+    pts = [(float(x), float(y), float(np.degrees(t)))
+           for (x, y), t in zip(caminho[1:], thetas[1:])]
+    if not pts:
+        print("[AVISO] Nenhum waypoint a enviar")
+        return False
+
+    resp = set_waypoints(ser, pts)
+    if not _ok(resp):
+        print(f"[ERRO] A placa nao aceitou os waypoints <W>: {resp}")
+        return False
+    print(f"[OK] {len(pts)} waypoints carregados na placa")
+    for x, y, th in pts:
+        print(f"[INFO] waypoint ({x:.3f}, {y:.3f}) theta {th:.1f} graus")
+
+    # Confere o que a placa guardou, em vez de confiar no <OK>.
+    guardados = list_waypoints(ser)
+    if guardados is None:
+        print("[AVISO] A placa nao respondeu a <L>; nao deu para conferir "
+              "a lista")
+    elif len(guardados) != len(pts):
+        print(f"[ERRO] A placa guardou {len(guardados)} waypoints, "
+              f"mas foram enviados {len(pts)}")
+        return False
+    else:
+        print(f"[OK] Lista conferida: {len(guardados)} waypoints na placa")
+
+    if not iniciar:
+        print("[INFO] Waypoints carregados, robo parado. Use --iniciar "
+              "para mandar <R>, ou 'start' no demo.py")
+        return True
+
+    ok, resp, msg = start(ser)
+    print(f"[{'OK' if ok else 'ERRO'}] <R>: {msg}")
+    return ok
+
 
 def main():
     ap = argparse.ArgumentParser(
@@ -1207,19 +1303,24 @@ def main():
     ap.add_argument("--sem-envio", action="store_true",
                     help="so gera a trajetoria e a figura, sem abrir a "
                          "porta serial nem enviar waypoints")
+    ap.add_argument("--iniciar", action="store_true",
+                    help="envia <R> no fim, e o robo comeca a navegar; "
+                         "sem isso os waypoints ficam so carregados")
+    ap.add_argument("--sem-pose", action="store_true",
+                    help="nao envia <O>; use se a odometria da placa ja "
+                         "estiver no referencial da mesa")
+    ap.add_argument("--theta-inicial", type=float, default=None,
+                    help="orientacao inicial do robo [graus]; o padrao e "
+                         "a medida da camera, que tem ambiguidade de 180 "
+                         "graus -- informe aqui se o robo arrancar de re")
     ap.add_argument("--port", default=DEFAULT_PORT, help="Porta serial utilizada para a comunicação com a placa")
     ap.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="Baudrate utilizado  para a comunicação com a placa")
 
     args = ap.parse_args()
 
-    ser = None
-    try:
-        if not args.sem_envio:
-            ser = connect(args.port, args.baud)
-    except serial.SerialException as e:
-        print(f"[AVISO] Não consegui abrir {args.port} @ {args.baud}: {e}")
-        print("Verifique: HC-05 emparelhado, Monitor Serial fechado, porta correta.")
-        sys.exit(1)
+    # A porta serial e aberta so no fim, depois de a trajetoria e a
+    # figura estarem salvas: se o Bluetooth falhar, o planejamento nao
+    # se perde junto.
 
     try:
         obstaculos, limites, robo = carregar_mapa(args.mapa)
@@ -1354,17 +1455,41 @@ def main():
     except ImportError:
         print("[AVISO] matplotlib indisponivel; figura nao gerada")
 
-    
-    if sucesso and ser is not None:
-        # O primeiro ponto da trajetoria e a pose atual do robo, entao
-        # nao vira waypoint.
-        waypoints = caminho[1:]
-        print(f"[OK] Enviando {len(waypoints)} waypoints "
-              f"({len(caminho)} pontos de trajetoria, limite "
-              f"{args.max_pontos or 'nenhum'})")
-        for setpoint in waypoints:
-            add_waypoint(ser, setpoint[0], setpoint[1])
-            print(f"[INFO] Waypoint {setpoint.round(4).tolist()} adicionado!")
+    # ------------------------------------------------------ envio a placa
+    if args.sem_envio:
+        print("[INFO] --sem-envio: nada foi enviado ao robo")
+        return
+    if not sucesso:
+        print("[AVISO] Trajetoria invalida; nada sera enviado ao robo")
+        return
+
+    try:
+        ser = connect(args.port, args.baud)
+    except serial.SerialException as e:
+        print(f"[ERRO] Nao consegui abrir {args.port} @ {args.baud}: {e}")
+        print("Verifique: HC-05 emparelhado, Monitor Serial fechado, "
+              "porta correta.")
+        list_ports()
+        print(f"[INFO] A trajetoria continua salva em '{args.saida}'")
+        sys.exit(1)
+
+    try:
+        pose = None
+        if not args.sem_pose:
+            theta0 = args.theta_inicial
+            if theta0 is None and robo is not None:
+                theta0 = robo.get("theta_graus")
+            if theta0 is None:
+                print("[AVISO] Sem orientacao inicial (o mapa nao traz "
+                      "'theta_graus' e --theta-inicial nao foi dado); "
+                      "a pose nao sera sincronizada")
+            else:
+                pose = (args.inicio[0], args.inicio[1], float(theta0))
+        enviar_trajetoria(ser, caminho, thetas, pose=pose,
+                          iniciar=args.iniciar)
+    finally:
+        ser.close()
+
 
 if __name__ == "__main__":
     main()
