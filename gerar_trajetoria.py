@@ -563,8 +563,77 @@ def reamostrar(pontos, passo_amostra):
     return np.asarray(saida)
 
 
+def reamostrar_n(pontos, n):
+    """Reamostra a poligonal em exatamente n pontos equidistantes.
+
+    Os pontos novos caem sobre os segmentos existentes, entao o caminho
+    continua livre de colisao; so muda onde estao os waypoints.
+    """
+    pontos = np.asarray(pontos, dtype=float)
+    if len(pontos) < 2 or n < 2:
+        return pontos
+    passos = np.linalg.norm(np.diff(pontos, axis=0), axis=1)
+    acumulado = np.concatenate([[0.0], np.cumsum(passos)])
+    alvos = np.linspace(0.0, acumulado[-1], n)
+    return np.column_stack([
+        np.interp(alvos, acumulado, pontos[:, 0]),
+        np.interp(alvos, acumulado, pontos[:, 1]),
+    ])
+
+
+def reduzir_pontos(pontos, livre, origem, passo, minimo=10, maximo=20):
+    """Deixa a trajetoria com um numero de waypoints entre os limites.
+
+    Acima do maximo, remove um vertice de cada vez -- sempre o que
+    menos alonga o caminho e cujo atalho continua em celulas livres --,
+    o que nunca introduz colisao. Abaixo do minimo, reamostra sobre os
+    proprios segmentos ate o alvo.
+    """
+    pontos = [np.asarray(p, dtype=float) for p in pontos]
+
+    while len(pontos) > maximo:
+        melhor, melhor_custo = None, np.inf
+        for i in range(1, len(pontos) - 1):
+            if not _visada_livre(pontos[i - 1], pontos[i + 1],
+                                 livre, origem, passo):
+                continue
+            # Quanto o caminho encurta/alonga ao pular o vertice i.
+            custo = (np.linalg.norm(pontos[i + 1] - pontos[i - 1])
+                     - np.linalg.norm(pontos[i] - pontos[i - 1])
+                     - np.linalg.norm(pontos[i + 1] - pontos[i]))
+            if custo < melhor_custo:
+                melhor, melhor_custo = i, custo
+        if melhor is None:
+            print(f"[AVISO] Nao da para descer de {len(pontos)} waypoints "
+                  f"sem cortar obstaculo")
+            break
+        pontos.pop(melhor)
+
+    pontos = np.asarray(pontos, dtype=float)
+    if len(pontos) < minimo:
+        pontos = reamostrar_n(pontos, minimo)
+    return pontos
+
+
+def orientacoes(pontos, theta_final=None):
+    """Theta de cada waypoint: a direcao do segmento que sai dele.
+
+    O robo e um disco, entao a orientacao nao entra no planejamento;
+    ela e so a direcao de deslocamento que o controlador deve seguir.
+    O ultimo ponto herda a orientacao do segmento que chega nele, ou
+    'theta_final' se for dado.
+    """
+    pontos = np.asarray(pontos, dtype=float)
+    if len(pontos) < 2:
+        return np.zeros(len(pontos))
+    d = np.diff(pontos, axis=0)
+    thetas = np.arctan2(d[:, 1], d[:, 0])
+    ultimo = thetas[-1] if theta_final is None else theta_final
+    return np.concatenate([thetas, [ultimo]])
+
+
 def plan_grid(inicio, objetivo, obstaculos, limites, passo=0.01,
-              suavizar=True, reamostragem=None):
+              suavizar=True, min_pontos=10, max_pontos=20):
     """Planejamento por decomposicao em celulas e busca A*.
 
     Discretiza o workspace, acha o caminho otimo em celulas, suaviza-o
@@ -618,8 +687,9 @@ def plan_grid(inicio, objetivo, obstaculos, limites, passo=0.01,
         pontos = suavizar_caminho(pontos, livre, origem, passo)
     pontos = np.asarray(pontos, dtype=float)
 
-    if reamostragem:
-        pontos = reamostrar(pontos, reamostragem)
+    if max_pontos:
+        pontos = reduzir_pontos(pontos, livre, origem, passo,
+                                minimo=min_pontos, maximo=max_pontos)
     return pontos, True
 
 
@@ -965,9 +1035,10 @@ def main():
                     help="[grid] lado da celula da grade [m]")
     ap.add_argument("--sem-suavizar", action="store_true",
                     help="[grid] mantem o caminho em degraus da grade")
-    ap.add_argument("--reamostragem", type=float, default=0.005,
-                    help="[grid] espacamento dos pontos da trajetoria [m]; "
-                         "0 mantem so os vertices")
+    ap.add_argument("--min-pontos", type=int, default=10,
+                    help="[grid] minimo de waypoints na trajetoria")
+    ap.add_argument("--max-pontos", type=int, default=20,
+                    help="[grid] maximo de waypoints na trajetoria")
     ap.add_argument("--k-attr", type=float, default=1.0)
     ap.add_argument("--k-rep", type=float, default=0.001)
     ap.add_argument("--d0", type=float, default=0.08,
@@ -981,13 +1052,18 @@ def main():
     ap.add_argument("--max-iter", type=int, default=5000)
     ap.add_argument("--saida", default="trajetoria.json")
     ap.add_argument("--figura", default="trajetoria.png")
+    ap.add_argument("--sem-envio", action="store_true",
+                    help="so gera a trajetoria e a figura, sem abrir a "
+                         "porta serial nem enviar waypoints")
     ap.add_argument("--port", default=DEFAULT_PORT, help="Porta serial utilizada para a comunicação com a placa")
     ap.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="Baudrate utilizado  para a comunicação com a placa")
 
     args = ap.parse_args()
 
+    ser = None
     try:
-        ser = connect(args.port, args.baud)
+        if not args.sem_envio:
+            ser = connect(args.port, args.baud)
     except serial.SerialException as e:
         print(f"[AVISO] Não consegui abrir {args.port} @ {args.baud}: {e}")
         print("Verifique: HC-05 emparelhado, Monitor Serial fechado, porta correta.")
@@ -1031,7 +1107,7 @@ def main():
         caminho, sucesso = plan_grid(
             args.inicio, args.objetivo, expandidos, limites_c,
             passo=args.passo, suavizar=not args.sem_suavizar,
-            reamostragem=args.reamostragem or None)
+            min_pontos=args.min_pontos, max_pontos=args.max_pontos)
     else:
         caminho, sucesso = plan_potencial(
             args.inicio, args.objetivo, expandidos,
@@ -1042,7 +1118,7 @@ def main():
     if sucesso:
         comprimento = float(np.sum(np.linalg.norm(
             np.diff(caminho, axis=0), axis=1)))
-        print(f"[OK] Objetivo alcancado: {len(caminho)} pontos, "
+        print(f"[OK] Objetivo alcancado: {len(caminho)} waypoints, "
               f"comprimento {comprimento:.4f} m")
     elif args.metodo == "grid":
         print("[AVISO] Nenhum caminho encontrado")
@@ -1050,10 +1126,15 @@ def main():
         print(f"[AVISO] Parou em {caminho[-1].round(4).tolist()} "
               f"apos {len(caminho)} passos (possivel minimo local)")
 
+    # Orientacao de cada waypoint: direcao do segmento que sai dele.
+    thetas = orientacoes(caminho)
+    theta_inicial = robo.get("theta_rad") if robo else None
+
     with open(args.saida, "w", encoding="utf-8") as f:
         json.dump({
             "inicio_xy_m": list(args.inicio),
             "objetivo_xy_m": list(args.objetivo),
+            "theta_inicial_robo_rad": theta_inicial,
             "metodo": args.metodo,
             "passo_grid_m": args.passo if args.metodo == "grid" else None,
             "sucesso": bool(sucesso),
@@ -1062,6 +1143,12 @@ def main():
             "margem_seguranca_m": args.margem,
             "raio_inflado_m": raio,
             "trajetoria_xy_m": caminho.round(5).tolist(),
+            "theta_rad": thetas.round(5).tolist(),
+            "theta_graus": np.degrees(thetas).round(2).tolist(),
+            "trajetoria_xytheta": [
+                [round(x, 5), round(y, 5), round(t, 5)]
+                for (x, y), t in zip(caminho, thetas)
+            ],
         }, f, indent=4)
     print(f"[OK] Trajetoria salva em '{args.saida}'")
 
@@ -1092,7 +1179,7 @@ def main():
         print("[AVISO] matplotlib indisponivel; figura nao gerada")
 
     
-    if sucesso:
+    if sucesso and ser is not None:
         for setpoint in caminho[1:]:
             add_waypoint(ser, setpoint[0], setpoint[1])
             print(f"[INFO] Waypoint {setpoint.round(4).tolist()} adicionado!")
