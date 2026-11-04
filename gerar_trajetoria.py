@@ -1278,19 +1278,45 @@ def wait_until_done_telemetry(ser, poll_s=0.4, timeout_s=90.0):
 
 
 def detectar_pose_camera(cam_arg, calib_arq="calibracao_mesa.json"):
-    """Captura um frame da câmera e retorna o dicionário 'dados_robo' atualizado em metros."""
+    """Captura um frame da camera e devolve o dict do robo (x_m, y_m, theta_graus...) ou None.
+
+    Reproduz as etapas de gerar_mapa.processar_mapa que importam para achar o robo:
+    cantos calibrados -> escala -> retificacao -> mascara da fita -> deteccao HSV.
+    """
+    import cv2
     import gerar_mapa as gm
+
     cfg = gm.ConfigMapa(sem_gui=True)
-    gm.carregar_calibracao(calib_arq, cfg)
+    if not gm.carregar_calibracao(calib_arq, cfg):
+        print(f"[ERRO] Calibracao '{calib_arq}' nao encontrada; malha fechada indisponivel.")
+        return None
     frame = gm.capturar_frame(cam_arg)
-    if cfg.cantos_calibrados is not None:
-        pontos_origem = np.asarray(cfg.cantos_calibrados, dtype=np.float32)
-    else:
-        pontos_origem = gm.detectar_mesa_auto(frame)
-    mesa_ret, H_mesa = gm.retificar_perspectiva(frame, pontos_origem, cfg)
-    mascara_mesa, _ = gm.construir_mascara_mesa_retificada(H_mesa, mesa_ret.shape[:2], cfg)
+    alt_img, larg_img = frame.shape[:2]
+    sx = sy = 1.0
+    if cfg.largura_camera_px > 0 and cfg.altura_camera_px > 0:
+        sx = larg_img / cfg.largura_camera_px
+        sy = alt_img / cfg.altura_camera_px
+
+    cantos = np.array(cfg.cantos_calibrados, dtype="float32")
+    cantos[:, 0] *= sx
+    cantos[:, 1] *= sy
+    escala = gm.calcular_escala_cantos_px(cantos, cfg.largura_mesa_m, cfg.altura_mesa_m)
+    cfg.pixels_por_metro = escala["pixels_por_metro"]
+    cfg.metros_por_pixel = escala["metros_por_pixel"]
+
+    mesa_ret = gm.retificar_mesa(frame, cantos, cfg)
+    mascara_mesa = None
+    if cfg.contorno_mesa_px is not None:
+        contorno = np.array(cfg.contorno_mesa_px, dtype="float32")
+        contorno[:, 0] *= sx
+        contorno[:, 1] *= sy
+        contorno_ret = gm.aplicar_homografia(contorno, gm.matriz_retificacao(cantos, cfg))
+        mascara_mesa = np.zeros(mesa_ret.shape[:2], np.uint8)
+        cv2.fillPoly(mascara_mesa, [np.round(contorno_ret).astype(np.int32)], 255)
+
     dados_robo, _ = gm.detectar_robo_hsv(mesa_ret, cfg, mascara_mesa)
     return dados_robo
+
 
 def main():
     ap = argparse.ArgumentParser(
@@ -1567,7 +1593,7 @@ def main():
             print(f"[INFO] Pose definida em ({rx:.3f}, {ry:.3f}, {theta_inicial_deg:.1f}°)")
 
             for setpoint, th_d in zip(waypoints, thetas_deg):
-                add_waypoint(ser, setpoint[0], setpoint[1], th_d)
+                add_waypoint(ser, setpoint[0], setpoint[1], 0.0)
                 print(f"[INFO] Waypoint {setpoint.round(4).tolist()} (th={th_d:.1f}°) adicionado!")
             ok_st, resp_st, msg_st = start(ser)
             print(f"[INFO] Início da navegação: {resp_st} ({msg_st})")
