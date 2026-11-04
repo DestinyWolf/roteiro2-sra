@@ -30,13 +30,14 @@ import argparse
 import heapq
 import json
 import numpy as np
+import limites_mesa
 import serial
 import serial.tools.list_ports
 import sys
 import time
 
-DEFAULT_PORT = "COM9"
-DEFAULT_BAUD = 57600
+DEFAULT_PORT = "/dev/ttyUSB0"
+DEFAULT_BAUD = 57600    
 TIMEOUT_S = 1.0
 RESPONSE_TIMEOUT_S = 2.0
 AUTO_EQ_S = 2.0
@@ -163,12 +164,18 @@ def encolher_limites(limites, margem):
     """Workspace reduzido da mesma margem aplicada aos obstaculos."""
     if not limites or margem <= 0.0:
         return limites
-    return {
+    encolhidos = {
         "x_min": limites["x_min"] + margem,
         "x_max": limites["x_max"] - margem,
         "y_min": limites["y_min"] + margem,
         "y_max": limites["y_max"] - margem,
     }
+    # O contorno real da mesa (fita preta) tambem encolhe: o robo, de raio
+    # 'margem', precisa ficar inteiro dentro dele.
+    contorno = limites_mesa.contorno_de_limites(limites)
+    if contorno is not None:
+        encolhidos["contorno"] = limites_mesa.encolher_contorno(contorno, margem)
+    return encolhidos
 
 
 # ---------------------------------------------------------------- potencial
@@ -216,6 +223,18 @@ def potencial(q, objetivo, obstaculos, k_attr=1.0, k_rep=0.001, d0=0.08,
         ]
         fontes.extend((d, direcao) for d, direcao in paredes if d < d0)
 
+        # Contorno real da mesa (fita preta): age como parede repulsiva.
+        contorno = limites_mesa.contorno_de_limites(limites)
+        if contorno is not None:
+            p = limites_mesa.ponto_mais_proximo_contorno(q, contorno)
+            dist = float(np.linalg.norm(q - p))
+            fora = not limites_mesa.dentro_varios(q, contorno)[0]
+            d = -dist if fora else dist
+            if d < d0 and dist > 1e-9:
+                # 'direcao' aponta da parede para q (para dentro da mesa
+                # quando q esta dentro; para fora quando q escapou).
+                fontes.append((d, (q - p) / dist))
+
     for d, direcao in fontes:
         if d <= 0.0:
             # Dentro do obstaculo/parede: empurra de volta com forca saturada.
@@ -252,10 +271,14 @@ def plan_potencial(inicio, objetivo, obstaculos, alpha=0.02, max_iter=5000,
         """Mantem o ponto dentro do workspace."""
         if not limites:
             return p
-        return np.array([
+        p = np.array([
             np.clip(p[0], limites["x_min"], limites["x_max"]),
             np.clip(p[1], limites["y_min"], limites["y_max"]),
         ])
+        contorno = limites_mesa.contorno_de_limites(limites)
+        if contorno is not None and not limites_mesa.dentro_varios(p, contorno)[0]:
+            p = limites_mesa.ponto_mais_proximo_contorno(p, contorno)
+        return p
 
     def livre(p):
         """Verdadeiro se p esta fora de todos os obstaculos."""
@@ -381,6 +404,16 @@ def construir_grid(obstaculos, limites, passo):
             pts = np.round((np.asarray(poligono, dtype=float) - origem)
                            / passo - 0.5).astype(np.int32)
             cv2.fillPoly(ocupado, [pts], 1)
+
+    # Fora do contorno real da mesa (fita preta) a celula e proibida.
+    contorno = limites_mesa.contorno_de_limites(limites)
+    if contorno is not None:
+        xs = origem[0] + (np.arange(largura) + 0.5) * passo
+        ys = origem[1] + (np.arange(altura) + 0.5) * passo
+        gx, gy = np.meshgrid(xs, ys)
+        centros = np.column_stack([gx.ravel(), gy.ravel()])
+        dentro = limites_mesa.dentro_varios(centros, contorno).reshape(altura, largura)
+        ocupado[~dentro] = 1
 
     return ocupado == 0, origem
 
@@ -641,6 +674,12 @@ def carregar_mapa(caminho_json):
     ]
     limites = dados.get("workspace_limites_m", {})
 
+    # Contorno real da mesa (interior da fita preta), medido na calibracao:
+    # os planejadores nao deixam o robo sair dele.
+    contorno = dados.get("workspace_contorno_xy_m")
+    if contorno and limites:
+        limites["contorno"] = np.array(contorno, dtype=float)
+
     return obstaculos, limites, dados.get("robo")
 
 
@@ -803,6 +842,10 @@ def plotar(caminho, obstaculos, expandidos, inicio, objetivo, limites,
     ax.plot(caminho[:, 0], caminho[:, 1], "-b", lw=2, label="trajetoria")
     ax.plot(*inicio, "go", ms=10, label="inicio")
     ax.plot(*objetivo, "r*", ms=15, label="objetivo")
+    contorno_mesa = limites_mesa.contorno_de_limites(limites)
+    if contorno_mesa is not None:
+        ax.add_patch(Polygon(contorno_mesa, closed=True, fill=False,
+                             edgecolor="m", lw=2, label="limite da mesa"))
     ax.set_xlim(limites.get("x_min", 0.0), limites.get("x_max", 1.2))
     ax.set_ylim(limites.get("y_min", 0.0), limites.get("y_max", 0.8))
     ax.set_aspect("equal")
@@ -883,16 +926,21 @@ def cmd_and_wait(ser, cmd, timeout=RESPONSE_TIMEOUT_S):
 # ---------------------------------------------------------------------------
 # Waypoints
 # ---------------------------------------------------------------------------
-def add_waypoint(ser, x, y, theta):
-    return cmd_and_wait(ser, f"A,{x:.3f},{y:.3f},{theta:.3f}")
+def add_waypoint(ser, x, y, th=None):
+    if th is not None:
+        return cmd_and_wait(ser, f"A,{x:.3f},{y:.3f},{th:.1f}")
+    return cmd_and_wait(ser, f"A,{x:.3f},{y:.3f}")
 
 
 def set_waypoints(ser, pts):
     if not pts:
         return cmd_and_wait(ser, "C")
     body = f"W,{len(pts)}"
-    for (x, y) in pts:
-        body += f",{x:.3f},{y:.3f}"
+    for pt in pts:
+        if len(pt) >= 3:
+            body += f",{pt[0]:.3f},{pt[1]:.3f},{pt[2]:.1f}"
+        else:
+            body += f",{pt[0]:.3f},{pt[1]:.3f}"
     return cmd_and_wait(ser, body)
 
 
@@ -900,8 +948,11 @@ def append_waypoints(ser, pts):
     if not pts:
         return None
     body = f"Q,{len(pts)}"
-    for (x, y) in pts:
-        body += f",{x:.3f},{y:.3f}"
+    for pt in pts:
+        if len(pt) >= 3:
+            body += f",{pt[0]:.3f},{pt[1]:.3f},{pt[2]:.1f}"
+        else:
+            body += f",{pt[0]:.3f},{pt[1]:.3f}"
     return cmd_and_wait(ser, body)
 
 
@@ -968,16 +1019,16 @@ def main():
                     help="[grid] lado da celula da grade [m]")
     ap.add_argument("--sem-suavizar", action="store_true",
                     help="[grid] mantem o caminho em degraus da grade")
-    ap.add_argument("--reamostragem", type=float, default=0.005,
+    ap.add_argument("--reamostragem", type=float, default=0.0,
                     help="[grid] espacamento dos pontos da trajetoria [m]; "
-                         "0 mantem so os vertices")
+                         "0 mantem so os vertices (padrao 0 para evitar paradas/coices intermediarios)")
     ap.add_argument("--k-attr", type=float, default=1.0)
     ap.add_argument("--k-rep", type=float, default=0.001)
     ap.add_argument("--d0", type=float, default=0.08,
                     help="raio de influencia do campo repulsivo [m]")
-    ap.add_argument("--raio-robo", type=float, default=0.05,
+    ap.add_argument("--raio-robo", type=float, default=0.14,
                     help="raio do robo [m]; infla os obstaculos pela soma "
-                         "de Minkowski (espaco de configuracoes)")
+                         "de Minkowski (padrao 0.14 m)")
     ap.add_argument("--margem", type=float, default=0.0,
                     help="folga de seguranca [m] somada ao raio do robo")
     ap.add_argument("--alpha", type=float, default=0.02)
@@ -1024,6 +1075,11 @@ def main():
               f"{len(obstaculos)} -> {len(expandidos)} poligonos")
 
     for nome, ponto in (("inicio", args.inicio), ("objetivo", args.objetivo)):
+        if not limites_mesa.ponto_dentro(ponto, limites_c):
+            print(f"[ERRO] O {nome} {ponto} esta fora do limite da mesa "
+                  f"calibrada (fita preta, ja descontado o raio do robo): "
+                  f"escolha outro ponto (ou reduza --raio-robo).")
+            return
         if any(dist_ponto_poligono(np.array(ponto), o) <= 0
                for o in expandidos):
             print(f"[ERRO] O {nome} {ponto} esta dentro de um obstaculo: "
@@ -1096,11 +1152,22 @@ def main():
 
     
     if sucesso:
-        set_pose(ser, robo.get("x_m"), robo.get("y_m"), robo.get("theta_rad"))
+        theta_inicial_deg = robo.get("theta_graus") if robo else None
+        if theta_inicial_deg is None and robo and "theta_rad" in robo:
+            theta_inicial_deg = float(np.degrees(robo["theta_rad"]))
+        if theta_inicial_deg is None:
+            theta_inicial_deg = 0.0
+
+        stop(ser)
+        rx = robo.get("x_m") if robo else caminho[0, 0]
+        ry = robo.get("y_m") if robo else caminho[0, 1]
+        set_pose(ser, rx, ry, theta_inicial_deg)
+        print(f"[INFO] Pose definida em ({rx:.3f}, {ry:.3f}, {theta_inicial_deg:.1f}°)")
         for setpoint in caminho[1:]:
-            add_waypoint(ser, setpoint[0], setpoint[1], setpoint[2])
+            add_waypoint(ser, setpoint[0], setpoint[1])
             print(f"[INFO] Waypoint {setpoint.round(4).tolist()} adicionado!")
-        start(ser)
+        ok_st, resp_st, msg_st = start(ser)
+        print(f"[INFO] Início da navegação: {resp_st} ({msg_st})")
 
 if __name__ == "__main__":
     main()

@@ -47,13 +47,14 @@ import argparse
 import heapq
 import json
 import numpy as np
+import limites_mesa
 import serial
 import serial.tools.list_ports
 import sys
 import time
 
-DEFAULT_PORT = "COM11"
-DEFAULT_BAUD = 115200
+DEFAULT_PORT = "/dev/ttyUSB0"
+DEFAULT_BAUD = 57600
 TIMEOUT_S = 1.0
 RESPONSE_TIMEOUT_S = 2.0
 AUTO_EQ_S = 2.0
@@ -64,8 +65,12 @@ STATE_NAMES = {0: "GIRAR", 1: "ANDAR", 2: "DONE"}
 # Numero de pontos da trajetoria, contando o inicio e o objetivo. O
 # robo recebe um waypoint por ponto menos o inicio, que e a pose onde
 # ele ja esta: no limite, 9 waypoints.
+# IMPORTANTE: MIN_PONTOS_TRAJETORIA = 0 evita subdividir trechos retos em
+# pontos intermediarios colineares (cada parada intermediaria faz o firmware
+# trocar ANDAR -> GIRAR -> ANDAR, dando um "coice" que derrapa as rodas e
+# acumula deriva angular na odometria).
 MAX_PONTOS_TRAJETORIA = 10
-MIN_PONTOS_TRAJETORIA = 10
+MIN_PONTOS_TRAJETORIA = 0
 
 # ---------------------------------------------------------------- geometria
 
@@ -186,12 +191,18 @@ def encolher_limites(limites, margem):
     """Workspace reduzido da mesma margem aplicada aos obstaculos."""
     if not limites or margem <= 0.0:
         return limites
-    return {
+    encolhidos = {
         "x_min": limites["x_min"] + margem,
         "x_max": limites["x_max"] - margem,
         "y_min": limites["y_min"] + margem,
         "y_max": limites["y_max"] - margem,
     }
+    # O contorno real da mesa (fita preta) tambem encolhe: o robo, de raio
+    # 'margem', precisa ficar inteiro dentro dele.
+    contorno = limites_mesa.contorno_de_limites(limites)
+    if contorno is not None:
+        encolhidos["contorno"] = limites_mesa.encolher_contorno(contorno, margem)
+    return encolhidos
 
 
 # ---------------------------------------------------------------- potencial
@@ -239,6 +250,18 @@ def potencial(q, objetivo, obstaculos, k_attr=1.0, k_rep=0.001, d0=0.08,
         ]
         fontes.extend((d, direcao) for d, direcao in paredes if d < d0)
 
+        # Contorno real da mesa (fita preta): age como parede repulsiva.
+        contorno = limites_mesa.contorno_de_limites(limites)
+        if contorno is not None:
+            p = limites_mesa.ponto_mais_proximo_contorno(q, contorno)
+            dist = float(np.linalg.norm(q - p))
+            fora = not limites_mesa.dentro_varios(q, contorno)[0]
+            d = -dist if fora else dist
+            if d < d0 and dist > 1e-9:
+                # 'direcao' aponta da parede para q (para dentro da mesa
+                # quando q esta dentro; para fora quando q escapou).
+                fontes.append((d, (q - p) / dist))
+
     for d, direcao in fontes:
         if d <= 0.0:
             # Dentro do obstaculo/parede: empurra de volta com forca saturada.
@@ -275,10 +298,14 @@ def plan_potencial(inicio, objetivo, obstaculos, alpha=0.02, max_iter=5000,
         """Mantem o ponto dentro do workspace."""
         if not limites:
             return p
-        return np.array([
+        p = np.array([
             np.clip(p[0], limites["x_min"], limites["x_max"]),
             np.clip(p[1], limites["y_min"], limites["y_max"]),
         ])
+        contorno = limites_mesa.contorno_de_limites(limites)
+        if contorno is not None and not limites_mesa.dentro_varios(p, contorno)[0]:
+            p = limites_mesa.ponto_mais_proximo_contorno(p, contorno)
+        return p
 
     def livre(p):
         """Verdadeiro se p esta fora de todos os obstaculos."""
@@ -404,6 +431,16 @@ def construir_grid(obstaculos, limites, passo):
             pts = np.round((np.asarray(poligono, dtype=float) - origem)
                            / passo - 0.5).astype(np.int32)
             cv2.fillPoly(ocupado, [pts], 1)
+
+    # Fora do contorno real da mesa (fita preta) a celula e proibida.
+    contorno = limites_mesa.contorno_de_limites(limites)
+    if contorno is not None:
+        xs = origem[0] + (np.arange(largura) + 0.5) * passo
+        ys = origem[1] + (np.arange(altura) + 0.5) * passo
+        gx, gy = np.meshgrid(xs, ys)
+        centros = np.column_stack([gx.ravel(), gy.ravel()])
+        dentro = limites_mesa.dentro_varios(centros, contorno).reshape(altura, largura)
+        ocupado[~dentro] = 1
 
     return ocupado == 0, origem
 
@@ -623,6 +660,8 @@ def _visada_poligonos(a, b, obstaculos, limites=None, passo=0.005):
                 or np.any(amostras[:, 0] > limites["x_max"])
                 or np.any(amostras[:, 1] < limites["y_min"])
                 or np.any(amostras[:, 1] > limites["y_max"])):
+            return False
+        if not limites_mesa.amostras_dentro(amostras, limites).all():
             return False
 
     for poligono in obstaculos:
@@ -858,6 +897,12 @@ def carregar_mapa(caminho_json):
     ]
     limites = dados.get("workspace_limites_m", {})
 
+    # Contorno real da mesa (interior da fita preta), medido na calibracao:
+    # os planejadores nao deixam o robo sair dele.
+    contorno = dados.get("workspace_contorno_xy_m")
+    if contorno and limites:
+        limites["contorno"] = np.array(contorno, dtype=float)
+
     return obstaculos, limites, dados.get("robo")
 
 
@@ -1020,6 +1065,10 @@ def plotar(caminho, obstaculos, expandidos, inicio, objetivo, limites,
     ax.plot(caminho[:, 0], caminho[:, 1], "-b", lw=2, label="trajetoria")
     ax.plot(*inicio, "go", ms=10, label="inicio")
     ax.plot(*objetivo, "r*", ms=15, label="objetivo")
+    contorno_mesa = limites_mesa.contorno_de_limites(limites)
+    if contorno_mesa is not None:
+        ax.add_patch(Polygon(contorno_mesa, closed=True, fill=False,
+                             edgecolor="m", lw=2, label="limite da mesa"))
     ax.set_xlim(limites.get("x_min", 0.0), limites.get("x_max", 1.2))
     ax.set_ylim(limites.get("y_min", 0.0), limites.get("y_max", 0.8))
     ax.set_aspect("equal")
@@ -1100,7 +1149,9 @@ def cmd_and_wait(ser, cmd, timeout=RESPONSE_TIMEOUT_S):
 # ---------------------------------------------------------------------------
 # Waypoints
 # ---------------------------------------------------------------------------
-def add_waypoint(ser, x, y):
+def add_waypoint(ser, x, y, th=None):
+    if th is not None:
+        return cmd_and_wait(ser, f"A,{x:.3f},{y:.3f},{th:.1f}")
     return cmd_and_wait(ser, f"A,{x:.3f},{y:.3f}")
 
 
@@ -1108,8 +1159,11 @@ def set_waypoints(ser, pts):
     if not pts:
         return cmd_and_wait(ser, "C")
     body = f"W,{len(pts)}"
-    for (x, y) in pts:
-        body += f",{x:.3f},{y:.3f}"
+    for pt in pts:
+        if len(pt) >= 3:
+            body += f",{pt[0]:.3f},{pt[1]:.3f},{pt[2]:.1f}"
+        else:
+            body += f",{pt[0]:.3f},{pt[1]:.3f}"
     return cmd_and_wait(ser, body)
 
 
@@ -1117,8 +1171,11 @@ def append_waypoints(ser, pts):
     if not pts:
         return None
     body = f"Q,{len(pts)}"
-    for (x, y) in pts:
-        body += f",{x:.3f},{y:.3f}"
+    for pt in pts:
+        if len(pt) >= 3:
+            body += f",{pt[0]:.3f},{pt[1]:.3f},{pt[2]:.1f}"
+        else:
+            body += f",{pt[0]:.3f},{pt[1]:.3f}"
     return cmd_and_wait(ser, body)
 
 
@@ -1162,6 +1219,79 @@ def start(ser, wait_auto_eq=True):
 def stop(ser):
     return cmd_and_wait(ser, "C")
 
+def set_pose(ser, x, y, th):
+    return cmd_and_wait(ser, f"O,{x:.3f},{y:.3f},{th:.1f}")
+
+
+def get_telemetry(ser, timeout=RESPONSE_TIMEOUT_S):
+    """Envia <T> e devolve dict com pose/estado do firmware, ou None."""
+    resp = cmd_and_wait(ser, "T", timeout)
+    if resp is None or not resp.startswith("<T,"):
+        return None
+    parts = resp[3:-1].split(",")
+    if len(parts) != 7:
+        return None
+    try:
+        return {
+            "x": float(parts[0]),
+            "y": float(parts[1]),
+            "th_deg": float(parts[2]),
+            "wp": int(parts[3]),
+            "state": int(parts[4]),
+            "v": float(parts[5]),
+            "w_deg": float(parts[6]),
+        }
+    except ValueError:
+        return None
+
+
+def format_telemetry(t):
+    if t is None:
+        return "(sem telemetria)"
+    st = STATE_NAMES.get(t["state"], "?")
+    return (
+        f"x={t['x']:+.3f}m  y={t['y']:+.3f}m  "
+        f"th={t['th_deg']:+7.2f}°  "
+        f"wp={t['wp']:2d}  st={st:5s}  "
+        f"v={t['v']:+.3f}m/s  w={t['w_deg']:+6.2f}°/s"
+    )
+
+
+def wait_until_done_telemetry(ser, poll_s=0.4, timeout_s=90.0):
+    """Monitora via <T> até pos_state == DONE (2) ou timeout."""
+    t0 = time.time()
+    last_wp = -1
+    while time.time() - t0 < timeout_s:
+        t = get_telemetry(ser)
+        if t is None:
+            time.sleep(poll_s)
+            continue
+        if t["wp"] != last_wp:
+            print(f"  [{time.time()-t0:5.1f}s] WP {t['wp']} -> {format_telemetry(t)}")
+            last_wp = t["wp"]
+        else:
+            print(f"  [{time.time()-t0:5.1f}s] {format_telemetry(t)}")
+        if t["state"] == 2:  # DONE
+            return True, t
+        time.sleep(poll_s)
+    return False, None
+
+
+def detectar_pose_camera(cam_arg, calib_arq="calibracao_mesa.json"):
+    """Captura um frame da câmera e retorna o dicionário 'dados_robo' atualizado em metros."""
+    import gerar_mapa as gm
+    cfg = gm.ConfigMapa(sem_gui=True)
+    gm.carregar_calibracao(calib_arq, cfg)
+    frame = gm.capturar_frame(cam_arg)
+    if cfg.cantos_calibrados is not None:
+        pontos_origem = np.asarray(cfg.cantos_calibrados, dtype=np.float32)
+    else:
+        pontos_origem = gm.detectar_mesa_auto(frame)
+    mesa_ret, H_mesa = gm.retificar_perspectiva(frame, pontos_origem, cfg)
+    mascara_mesa, _ = gm.construir_mascara_mesa_retificada(H_mesa, mesa_ret.shape[:2], cfg)
+    dados_robo, _ = gm.detectar_robo_hsv(mesa_ret, cfg, mascara_mesa)
+    return dados_robo
+
 def main():
     ap = argparse.ArgumentParser(
         description="Gera trajetoria por decomposicao em celulas (grid) "
@@ -1195,11 +1325,20 @@ def main():
     ap.add_argument("--k-rep", type=float, default=0.001)
     ap.add_argument("--d0", type=float, default=0.08,
                     help="raio de influencia do campo repulsivo [m]")
-    ap.add_argument("--raio-robo", type=float, default=0.05,
+    ap.add_argument("--raio-robo", type=float, default=0.14,
                     help="raio do robo [m]; infla os obstaculos pela soma "
-                         "de Minkowski (espaco de configuracoes)")
+                         "de Minkowski (padrao 0.14 m = largura real das rodas + folga)")
     ap.add_argument("--margem", type=float, default=0.0,
                     help="folga de seguranca [m] somada ao raio do robo")
+    ap.add_argument("--fator-odometria", type=float, default=1.0,
+                    help="fator de escala aplicado aos deslocamentos enviados ao robo "
+                         "(ex: 0.85 se o robo anda ~18%% a mais do que o comandado)")
+    ap.add_argument("--sem-telemetria", action="store_true",
+                    help="nao aguarda/monitora a telemetria <T> apos iniciar a navegacao")
+    ap.add_argument("--malha-fechada", action="store_true",
+                    help="envia 1 waypoint por vez e corrige a pose (x, y, theta) via camera (--cam) a cada parada")
+    ap.add_argument("--cam", type=str, nargs="?", const="Iriun", default=None,
+                    help="camera usada no modo --malha-fechada (padrao: Iriun ou indice como 0)")
     ap.add_argument("--alpha", type=float, default=0.02)
     ap.add_argument("--max-iter", type=int, default=5000)
     ap.add_argument("--saida", default="trajetoria.json")
@@ -1249,6 +1388,11 @@ def main():
               f"{len(obstaculos)} -> {len(expandidos)} poligonos")
 
     for nome, ponto in (("inicio", args.inicio), ("objetivo", args.objetivo)):
+        if not limites_mesa.ponto_dentro(ponto, limites_c):
+            print(f"[ERRO] O {nome} {ponto} esta fora do limite da mesa "
+                  f"calibrada (fita preta, ja descontado o raio do robo): "
+                  f"escolha outro ponto (ou reduza --raio-robo).")
+            return
         if any(dist_ponto_poligono(np.array(ponto), o) <= 0
                for o in expandidos):
             print(f"[ERRO] O {nome} {ponto} esta dentro de um obstaculo: "
@@ -1357,14 +1501,86 @@ def main():
     
     if sucesso and ser is not None:
         # O primeiro ponto da trajetoria e a pose atual do robo, entao
-        # nao vira waypoint.
-        waypoints = caminho[1:]
-        print(f"[OK] Enviando {len(waypoints)} waypoints "
-              f"({len(caminho)} pontos de trajetoria, limite "
-              f"{args.max_pontos or 'nenhum'})")
-        for setpoint in waypoints:
-            add_waypoint(ser, setpoint[0], setpoint[1])
-            print(f"[INFO] Waypoint {setpoint.round(4).tolist()} adicionado!")
+        # nao vira waypoint. Para cada waypoint caminho[k+1], o angulo
+        # da reta que chega nele (caminho[k] -> caminho[k+1]) e thetas[k],
+        # isto e, thetas[:-1] (evitando desalinhamento entre a reta percorrida
+        # e o angulo th enviado ao firmware nos pontos intermediarios).
+        waypoints = caminho[1:].copy()
+        thetas_deg = np.degrees(thetas)[:-1]
+        theta_inicial_deg = robo.get("theta_graus") if robo else None
+        if theta_inicial_deg is None and robo and "theta_rad" in robo:
+            theta_inicial_deg = float(np.degrees(robo["theta_rad"]))
+        if theta_inicial_deg is None:
+            theta_inicial_deg = float(np.degrees(thetas[0]))
+
+        rx = float(robo.get("x_m")) if robo else float(caminho[0, 0])
+        ry = float(robo.get("y_m")) if robo else float(caminho[0, 1])
+        pos_ini = np.array([rx, ry], dtype=float)
+
+        # Aplica fator de correção de escala de odometria (caso o robô ande sistematicamente mais que o comandado)
+        if abs(args.fator_odometria - 1.0) > 1e-6:
+            waypoints = pos_ini + args.fator_odometria * (waypoints - pos_ini)
+            print(f"[INFO] Fator de odometria {args.fator_odometria:.3f} aplicado aos waypoints.")
+
+        if args.malha_fechada and args.cam is not None:
+            print(f"[OK] Modo MALHA FECHADA ativado com câmera '{args.cam}'.")
+            cur_x, cur_y, cur_th = rx, ry, theta_inicial_deg
+            for idx_wp, (setpoint, th_d) in enumerate(zip(waypoints, thetas_deg)):
+                print(f"\n--- Etapa {idx_wp + 1}/{len(waypoints)}: indo para {setpoint.round(4).tolist()} ---")
+                stop(ser)
+                set_pose(ser, cur_x, cur_y, cur_th)
+                print(f"[INFO] Pose atual no robô: ({cur_x:.3f}, {cur_y:.3f}, {cur_th:.1f}°)")
+                add_waypoint(ser, setpoint[0], setpoint[1], th_d)
+                ok_st, resp_st, msg_st = start(ser)
+                print(f"[INFO] Navegando: {resp_st} ({msg_st})")
+                wait_until_done_telemetry(ser)
+                time.sleep(0.4)
+                novo_robo = detectar_pose_camera(args.cam)
+                if novo_robo is not None:
+                    cur_x = float(novo_robo["x_m"])
+                    cur_y = float(novo_robo["y_m"])
+                    cur_th = float(novo_robo["theta_graus"])
+                    erro_wp = float(np.hypot(setpoint[0] - cur_x, setpoint[1] - cur_y))
+                    print(f"[CÂMERA] Pose real medida: ({cur_x:.3f}m, {cur_y:.3f}m, {cur_th:.1f}°) | Erro ao alvo: {erro_wp:.3f}m")
+            # Correção final se ainda estiver a mais de 5 cm do objetivo
+            obj_x, obj_y = float(args.objetivo[0]), float(args.objetivo[1])
+            erro_final = float(np.hypot(obj_x - cur_x, obj_y - cur_y))
+            if erro_final > 0.05:
+                print(f"\n--- Ajuste fino final para o objetivo ({obj_x:.3f}, {obj_y:.3f}) (erro={erro_final:.3f}m) ---")
+                stop(ser)
+                set_pose(ser, cur_x, cur_y, cur_th)
+                th_corr = float(np.degrees(np.arctan2(obj_y - cur_y, obj_x - cur_x)))
+                wp_corr = np.array([cur_x, cur_y]) + args.fator_odometria * np.array([obj_x - cur_x, obj_y - cur_y])
+                add_waypoint(ser, wp_corr[0], wp_corr[1], th_corr)
+                start(ser)
+                wait_until_done_telemetry(ser)
+        else:
+            print(f"[OK] Enviando {len(waypoints)} waypoints "
+                  f"({len(caminho)} pontos de trajetoria, limite "
+                  f"{args.max_pontos or 'nenhum'})")
+
+            # Limpa a lista anterior de waypoints no firmware (<C>) antes de definir a pose e adicionar os novos pontos
+            stop(ser)
+
+            # O firmware do robô espera o ângulo de orientação em GRAUS (e não em radianos)
+            set_pose(ser, rx, ry, theta_inicial_deg)
+            print(f"[INFO] Pose definida em ({rx:.3f}, {ry:.3f}, {theta_inicial_deg:.1f}°)")
+
+            for setpoint, th_d in zip(waypoints, thetas_deg):
+                add_waypoint(ser, setpoint[0], setpoint[1], th_d)
+                print(f"[INFO] Waypoint {setpoint.round(4).tolist()} (th={th_d:.1f}°) adicionado!")
+            ok_st, resp_st, msg_st = start(ser)
+            print(f"[INFO] Início da navegação: {resp_st} ({msg_st})")
+            if ok_st and not args.sem_telemetria:
+                print("[INFO] Monitorando telemetria <T> do robô até concluir (Ctrl+C para interromper)...")
+                try:
+                    done, last_t = wait_until_done_telemetry(ser)
+                    if done and last_t is not None:
+                        print(f"[OK] Robô concluiu navegação! Pose final pela odometria interna: "
+                              f"({last_t['x']:.3f}m, {last_t['y']:.3f}m, {last_t['th_deg']:.1f}°)")
+                except KeyboardInterrupt:
+                    print("\n[AVISO] Monitoramento interrompido pelo usuário. Enviando <C> (stop)...")
+                    stop(ser)
 
 if __name__ == "__main__":
     main()
