@@ -1118,6 +1118,36 @@ def capturar_frame(camera) -> np.ndarray:
         cv2.destroyWindow(nome_janela)
 
 
+def corrigir_distorcao(imagem: np.ndarray, caminho_npz: str) -> np.ndarray:
+    """
+    Aplica a correção de distorção da lente usando K e dist salvos em um .npz
+    (gerado por calibracao_camera.py). Se o arquivo não existir, devolve a
+    imagem original. Se a resolução do frame difere da usada na calibração,
+    K é reescalado.
+    """
+    if not os.path.isabs(caminho_npz) and not os.path.exists(caminho_npz):
+        caminho_npz = os.path.join(os.path.dirname(os.path.abspath(__file__)), caminho_npz)
+    if not os.path.exists(caminho_npz):
+        print(f"[AVISO] Calibração da câmera '{caminho_npz}' não encontrada; imagem sem correção de distorção.")
+        return imagem
+
+    dados = np.load(caminho_npz)
+    K = dados["K"].astype(np.float64)
+    dist = dados["dist"].astype(np.float64)
+
+    alt, larg = imagem.shape[:2]
+    if "image_size" in dados.files:
+        larg_cal, alt_cal = (int(v) for v in dados["image_size"])
+        if (larg_cal, alt_cal) != (larg, alt):
+            K[0, :] *= larg / larg_cal
+            K[1, :] *= alt / alt_cal
+            print(f"[INFO] Resolução ({larg}x{alt}) difere da calibração da câmera ({larg_cal}x{alt_cal}); K reescalado.")
+
+    corrigida = cv2.undistort(imagem, K, dist)
+    print("[INFO] Distorção da lente corrigida com", os.path.basename(caminho_npz))
+    return corrigida
+
+
 # ==============================================================================
 # 5. EXECUÇÃO PRINCIPAL
 # ==============================================================================
@@ -1270,6 +1300,10 @@ if __name__ == "__main__":
     parser.add_argument('--lado', type=float, help=f"lado de cada quadrado do tabuleiro em metros (padrão: {TABULEIRO_LADO_M})")
     parser.add_argument('--calib-arq', default="calibracao_mesa.json", help="arquivo de calibração")
     parser.add_argument('--sem-calib', action='store_true', help="ignora o arquivo de calibração existente")
+    parser.add_argument('--cam-calib', default="calibracao_camera.npz",
+                        help="arquivo .npz (K, dist, image_size) gerado por calibracao_camera.py")
+    parser.add_argument('--sem-undistort', action='store_true',
+                        help="não corrige a distorção da lente")
     parser.add_argument('--sem-gui', action='store_true',
                         help="não abre janelas (salva as imagens de conferência em arquivos .png)")
     parser.add_argument('--limiar-fita', type=int, default=60,
@@ -1312,6 +1346,10 @@ if __name__ == "__main__":
         imagem_entrada = cv2.imread(args.img)
         if imagem_entrada is None:
             raise FileNotFoundError(f"Não foi possível carregar a imagem: {args.img}")
+
+    # Remove a distorção da lente com os parâmetros intrínsecos da câmera
+    if not args.sem_undistort:
+        imagem_entrada = corrigir_distorcao(imagem_entrada, args.cam_calib)
 
     if args.calibrar:
         calibracao = calibrar_com_tabuleiro(imagem_entrada, args.tab[0], args.tab[1], args.lado, config)
