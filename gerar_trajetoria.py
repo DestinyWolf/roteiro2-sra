@@ -1,46 +1,35 @@
-"""Geracao de trajetoria por decomposicao em celulas (grid).
+"""Geracao de trajetoria com Campos de Potencial em Grid (Brushfire + A*) e Minkowski.
 
 Le o mapa de obstaculos poligonais produzido por 'gerar_mapa.py'
-(mapa_obstaculos.json) e gera uma trajetoria do ponto inicial ate o
-objetivo.
+(mapa_obstaculos.json) e gera uma trajetoria segura do ponto inicial
+ate o objetivo.
 
-O metodo padrao e o de grid: o workspace e discretizado numa grade
-regular, cada celula e classificada em livre ou ocupada, e o caminho
-sai de uma busca A* 8-conectada sobre as celulas livres, depois
-suavizada por atalhos em linha de visada. A busca e completa e otima
-na resolucao da grade: se existe caminho representavel, ela o acha.
-
-O metodo de campos potenciais (descida de gradiente sobre
-U = U_attr + U_rep) continua disponivel em '--metodo potencial', para
-comparacao: e reativo e barato, mas nao e completo (pode parar num
-minimo local).
-
-O robo e um disco de raio '--raio-robo' (0.22 m por padrao). O
-planejamento acontece no espaco de configuracoes: 'expandir_obstaculos'
-infla cada obstaculo pela soma de Minkowski com um disco desse raio, e
-sobre o mapa inflado o robo volta a ser um ponto. Assim um ponto livre
-no mapa inflado equivale ao disco inteiro livre no mapa real.
-
-'--margem' soma uma folga extra ao raio; o raio usado na expansao e
-'raio_robo + margem'. Com os dois em zero o planejamento e o do ponto
-puro.
-
-A trajetoria entregue tem no maximo MAX_PONTOS_TRAJETORIA pontos (10),
-contando o inicio e o objetivo -- ou seja, no maximo 9 waypoints para o
-robo, que ja esta no primeiro ponto. O limite vale para os dois metodos
-e e ajustavel por '--max-pontos'.
-
-Quem corta e 'limitar_pontos': remove um vertice de cada vez, sempre o
-que menos altera a forma do caminho, e so aceita a remocao quando o
-atalho que substitui o vertice continua em linha de visada livre. Por
-isso a trajetoria de 10 pontos ainda e um caminho valido, e nao uma
-aproximacao do original. No outro sentido, '--min-pontos' (10) completa
-com pontos dentro dos segmentos quando o caminho sai curto demais,
-sempre mantendo os vertices, para o controlador receber setpoints bem
-distribuidos.
-
-O robo atual nao usa o theta dos waypoints: todos sao enviados com
-theta = 0.0. Apenas o theta da pose inicial e necessario.
+Modelagem e algoritmos implementados:
+1. Soma de Minkowski ('expandir_obstaculos'): infla cada obstaculo (e
+   encolhe o contorno da mesa) pelo raio do robo ('--raio-robo' + '--margem'),
+   permitindo tratar o robo como uma particula pontual no espaco de
+   configuracoes (C-space).
+2. Decomposicao em Grid ('construir_grid'): discretiza o C-space em
+   celulas regulares livres ou ocupadas.
+3. Algoritmo Brushfire ('mapa_brushfire'): espalhamento em largura (BFS)
+   a partir das celulas ocupadas e limites da mesa para calcular a
+   distancia de cada celula livre ate o obstaculo mais proximo.
+4. Campo de Potencial no Grid ('potencial_repulsivo_brushfire'): gera um
+   potencial repulsivo nas celulas proximas aos obstaculos (dentro do
+   raio de influencia '--d0'), empurrando o caminho para longe das quinas
+   e paredes para compensar a deriva da odometria.
+5. Busca A* ('busca_a_estrela'): encontra o caminho de menor custo
+   combinando a distancia euclidiana/octil (potencial atrativo ao objetivo)
+   com o potencial repulsivo do Brushfire.
+6. Suavizacao e Limitacao de Waypoints ('suavizar_caminho', 'reduzir_pontos'):
+   remove degraus desnecessarios da grade preservando a folga do Brushfire
+   e garante no maximo 15 waypoints (16 pontos contando o inicio), sem
+   subdividir retas (evitando paradas intermediarias que causam deriva
+   no robo de auto-equilibrio).
+7. Comunicacao com o Robo (protocolo de 'demo.py'): envia a pose inicial
+   com (x, y, theta_inicial) via <O,x,y,th> e os waypoints com (x, y, 0.0)
+   via <W,...> / <A,x,y,0.0>, com pre-compensacao de escala e deriva
+   da odometria interna (--fator-odometria, --comp-angular-graus).
 """
 
 import argparse
@@ -53,7 +42,7 @@ import serial.tools.list_ports
 import sys
 import time
 
-DEFAULT_PORT = "/dev/ttyUSB0"
+DEFAULT_PORT = "/dev/ttyUSB1"
 DEFAULT_BAUD = 57600
 TIMEOUT_S = 1.0
 RESPONSE_TIMEOUT_S = 2.0
@@ -62,15 +51,15 @@ START_GRACE_S = 2.5
 
 STATE_NAMES = {0: "GIRAR", 1: "ANDAR", 2: "DONE"}
 
-# Numero de pontos da trajetoria, contando o inicio e o objetivo. O
-# robo recebe um waypoint por ponto menos o inicio, que e a pose onde
-# ele ja esta: no limite, 9 waypoints.
-# IMPORTANTE: MIN_PONTOS_TRAJETORIA = 0 evita subdividir trechos retos em
-# pontos intermediarios colineares (cada parada intermediaria faz o firmware
-# trocar ANDAR -> GIRAR -> ANDAR, dando um "coice" que derrapa as rodas e
-# acumula deriva angular na odometria).
-MAX_PONTOS_TRAJETORIA = 10
+# Restricao do professor: no maximo 15 waypoints alem do ponto inicial
+# (total de 16 pontos na trajetoria contando o ponto de partida).
+# MIN_PONTOS_TRAJETORIA = 0 evita subdividir segmentos retos em pontos
+# colineares (cada parada intermediaria no Minibalance faz o controlador
+# alternar ANDAR -> GIRAR -> ANDAR, gerando solavancos e deriva angular).
+MAX_WAYPOINTS_ROBO = 15
+MAX_PONTOS_TRAJETORIA = MAX_WAYPOINTS_ROBO + 1
 MIN_PONTOS_TRAJETORIA = 0
+
 
 # ---------------------------------------------------------------- geometria
 
@@ -137,18 +126,8 @@ def expandir_obstaculos(obstaculos, margem, limites, passo=0.002):
 
     Implementada como dilatacao morfologica com elemento estruturante
     circular: por definicao, a dilatacao de um conjunto por um disco E a
-    soma de Minkowski dos dois. Fazer isso sobre uma mascara rasterizada
-    (e nao deslocando as arestas uma a uma) resolve de graca os dois
-    casos em que o offset analitico falha: vertices reflexos, onde as
-    arestas deslocadas se auto-interceptam, e obstaculos que se fundem
-    ao crescer.
-
-    'margem' aqui e o raio total inflado: o raio do robo mais a folga
-    de seguranca pedida. Com margem 0 a funcao devolve os obstaculos
-    inalterados.
-
-    Pode devolver menos poligonos que a entrada, quando dois obstaculos
-    se encostam apos a expansao.
+    soma de Minkowski dos dois. Trata o robo de raio 'margem' como uma
+    particula pontual no espaco de configuracoes.
     """
     if margem <= 0.0:
         return [np.asarray(o, dtype=float) for o in obstaculos]
@@ -178,8 +157,7 @@ def expandir_obstaculos(obstaculos, margem, limites, passo=0.002):
 
     expandidos = []
     for c in contornos:
-        # Simplifica mantendo o erro bem abaixo da resolucao do raster.
-        c = cv2.approxPolyDP(c, 0.8, True)   # 0.8 pixel
+        c = cv2.approxPolyDP(c, 0.8, True)
         pts = c.reshape(-1, 2).astype(float) * passo + [x0 - borda,
                                                         y0 - borda]
         if len(pts) >= 3:
@@ -197,27 +175,17 @@ def encolher_limites(limites, margem):
         "y_min": limites["y_min"] + margem,
         "y_max": limites["y_max"] - margem,
     }
-    # O contorno real da mesa (fita preta) tambem encolhe: o robo, de raio
-    # 'margem', precisa ficar inteiro dentro dele.
     contorno = limites_mesa.contorno_de_limites(limites)
     if contorno is not None:
         encolhidos["contorno"] = limites_mesa.encolher_contorno(contorno, margem)
     return encolhidos
 
 
-# ---------------------------------------------------------------- potencial
+# ------------------------------------------------ potencial continuo (opcional)
 
 def potencial(q, objetivo, obstaculos, k_attr=1.0, k_rep=0.001, d0=0.08,
               d_max=0.3, limites=None):
-    """Potencial total e seu gradiente em q.
-
-    Atrativo: quadratico perto do objetivo e conico acima de 'd_max',
-    para evitar gradientes muito grandes quando o objetivo esta longe.
-    Repulsivo: potencial de Khatib, ativo somente a menos de 'd0' do
-    obstaculo (e tambem das paredes do workspace), multiplicado por ||q - objetivo||^2 para que se anule no
-    objetivo (correcao GNRON, necessaria quando o objetivo esta a menos
-    de 'd0' de um obstaculo).
-    """
+    """Potencial continuo total e seu gradiente em q."""
     q = np.asarray(q, dtype=float)
     objetivo = np.asarray(objetivo, dtype=float)
 
@@ -230,7 +198,6 @@ def potencial(q, objetivo, obstaculos, k_attr=1.0, k_rep=0.001, d0=0.08,
         U = k_attr * d_max * d_objetivo - 0.5 * k_attr * d_max ** 2
         grad = k_attr * d_max * erro / d_objetivo
 
-    # (distancia, direcao de afastamento) de cada fonte repulsiva
     fontes = []
     for poligono in obstaculos:
         d = dist_ponto_poligono(q, poligono)
@@ -250,7 +217,6 @@ def potencial(q, objetivo, obstaculos, k_attr=1.0, k_rep=0.001, d0=0.08,
         ]
         fontes.extend((d, direcao) for d, direcao in paredes if d < d0)
 
-        # Contorno real da mesa (fita preta): age como parede repulsiva.
         contorno = limites_mesa.contorno_de_limites(limites)
         if contorno is not None:
             p = limites_mesa.ponto_mais_proximo_contorno(q, contorno)
@@ -258,13 +224,10 @@ def potencial(q, objetivo, obstaculos, k_attr=1.0, k_rep=0.001, d0=0.08,
             fora = not limites_mesa.dentro_varios(q, contorno)[0]
             d = -dist if fora else dist
             if d < d0 and dist > 1e-9:
-                # 'direcao' aponta da parede para q (para dentro da mesa
-                # quando q esta dentro; para fora quando q escapou).
                 fontes.append((d, (q - p) / dist))
 
     for d, direcao in fontes:
         if d <= 0.0:
-            # Dentro do obstaculo/parede: empurra de volta com forca saturada.
             d_eff = 1e-3
             direcao = -direcao
         else:
@@ -282,20 +245,13 @@ def potencial(q, objetivo, obstaculos, k_attr=1.0, k_rep=0.001, d0=0.08,
 def plan_potencial(inicio, objetivo, obstaculos, alpha=0.02, max_iter=5000,
                    tol=0.01, passo_max=0.01, max_escapes=20,
                    **kw_potencial):
-    """Descida de gradiente sobre o potencial.
-
-    Campos potenciais tem minimos locais; quando a distancia ao objetivo
-    deixa de cair, o planejador passa a seguir a direcao tangencial ao
-    gradiente (contorno do obstaculo) por alguns passos ate voltar a
-    progredir. Retorna (caminho, sucesso).
-    """
+    """Descida de gradiente sobre o potencial continuo."""
     limites = kw_potencial.get("limites")
     q = np.array(inicio, dtype=float)
     objetivo = np.array(objetivo, dtype=float)
     caminho = [q.copy()]
 
     def confinar(p):
-        """Mantem o ponto dentro do workspace."""
         if not limites:
             return p
         p = np.array([
@@ -308,18 +264,16 @@ def plan_potencial(inicio, objetivo, obstaculos, alpha=0.02, max_iter=5000,
         return p
 
     def livre(p):
-        """Verdadeiro se p esta fora de todos os obstaculos."""
         return all(dist_ponto_poligono(p, o) > 0.0 for o in obstaculos)
 
     def sentido_contorno(p, direcao_grad):
-        """Lado do contorno cuja tangente aponta mais para o objetivo."""
         perp = np.array([-direcao_grad[1], direcao_grad[0]])
         return 1.0 if perp @ (objetivo - p) >= 0.0 else -1.0
 
-    janela = 50            # passos entre duas medidas de progresso
-    passos_tangencial = 0  # passos restantes em modo de contorno
-    sinal = 1.0            # sentido do contorno
-    tentativas = 0         # escapes consecutivos sem progresso
+    janela = 50
+    passos_tangencial = 0
+    sinal = 1.0
+    tentativas = 0
     escapes = 0
     d_anterior = np.linalg.norm(q - objetivo)
 
@@ -330,15 +284,12 @@ def plan_potencial(inicio, objetivo, obstaculos, alpha=0.02, max_iter=5000,
         _, grad = potencial(q, objetivo, obstaculos, **kw_potencial)
         norma = np.linalg.norm(grad)
 
-        # Progresso medido a cada 'janela' passos.
         if it > 0 and it % janela == 0:
             d_atual = np.linalg.norm(q - objetivo)
             if d_atual > d_anterior - 1e-4 and passos_tangencial == 0:
                 if escapes >= max_escapes:
-                    break  # minimo local do qual nao se escapou
+                    break
                 escapes += 1
-                # Primeira tentativa: contorna pelo lado do objetivo.
-                # Se nao resolveu, tenta o outro lado, indo mais longe.
                 if tentativas == 0 and norma > 1e-9:
                     sinal = sentido_contorno(q, -grad / norma)
                 else:
@@ -350,8 +301,6 @@ def plan_potencial(inicio, objetivo, obstaculos, alpha=0.02, max_iter=5000,
             d_anterior = d_atual
 
         if norma < 1e-9:
-            # Minimo local exato (gradiente nulo): escapa pela tangente
-            # a direcao do objetivo.
             if escapes >= max_escapes:
                 break
             escapes += 1
@@ -366,12 +315,9 @@ def plan_potencial(inicio, objetivo, obstaculos, alpha=0.02, max_iter=5000,
             direcao = -grad / norma
 
         if passos_tangencial > 0:
-            # Gira a direcao 90 graus: segue o contorno do obstaculo.
             direcao = sinal * np.array([-direcao[1], direcao[0]])
             passos_tangencial -= 1
 
-        # Nunca entra no obstaculo: tenta a direcao do gradiente e, se
-        # ela estiver bloqueada, as duas tangentes e passos menores.
         comprimento = min(alpha * norma, passo_max)
         perp = np.array([-direcao[1], direcao[0]])
         q_novo = None
@@ -385,7 +331,7 @@ def plan_potencial(inicio, objetivo, obstaculos, alpha=0.02, max_iter=5000,
                 break
 
         if q_novo is None:
-            break  # totalmente bloqueado
+            break
 
         q = q_novo
         caminho.append(q.copy())
@@ -394,20 +340,13 @@ def plan_potencial(inicio, objetivo, obstaculos, alpha=0.02, max_iter=5000,
     return np.array(caminho), sucesso
 
 
-# -------------------------------------------------------------------- grid
+# ----------------------------------------- Grid + Brushfire + Potencial + A*
 
 def construir_grid(obstaculos, limites, passo):
-    """Rasteriza o workspace numa grade regular de ocupacao.
+    """Rasteriza o workspace (no C-space) numa grade regular de ocupacao.
 
-    Devolve (livre, origem): 'livre' e uma matriz booleana
-    [altura x largura] com True nas celulas cujo centro esta fora de
-    todos os obstaculos, e 'origem' e o canto (x_min, y_min). O centro
-    da celula (i, j) fica em origem + (j + 0.5, i + 0.5) * passo.
-
-    A classificacao olha apenas o centro da celula, entao uma celula
-    parcialmente ocupada pode sair livre. Isso e o erro de
-    discretizacao inerente ao metodo; a folga em relacao aos
-    obstaculos vem de '--margem', aplicada antes (Minkowski).
+    Devolve (livre, origem): 'livre' e uma matriz booleana [altura x largura]
+    com True nas celulas livres, e 'origem' e o canto (x_min, y_min).
     """
     x0, y0 = limites["x_min"], limites["y_min"]
     largura = max(1, int(np.ceil((limites["x_max"] - x0) / passo)))
@@ -418,21 +357,17 @@ def construir_grid(obstaculos, limites, passo):
     try:
         import cv2
     except ImportError:
-        # Sem OpenCV: testa o centro de cada celula por ray casting.
         for i in range(altura):
             for j in range(largura):
                 c = origem + (np.array([j, i]) + 0.5) * passo
                 if any(ponto_dentro_poligono(c, o) for o in obstaculos):
                     ocupado[i, j] = 1
     else:
-        # fillPoly trabalha em indices de celula; o centro da celula j
-        # corresponde ao vertice x em (x - x0)/passo - 0.5.
         for poligono in obstaculos:
             pts = np.round((np.asarray(poligono, dtype=float) - origem)
                            / passo - 0.5).astype(np.int32)
             cv2.fillPoly(ocupado, [pts], 1)
 
-    # Fora do contorno real da mesa (fita preta) a celula e proibida.
     contorno = limites_mesa.contorno_de_limites(limites)
     if contorno is not None:
         xs = origem[0] + (np.arange(largura) + 0.5) * passo
@@ -445,17 +380,78 @@ def construir_grid(obstaculos, limites, passo):
     return ocupado == 0, origem
 
 
-def mapa_wavefront(livre, objetivo_ij):
-    """Valor de cada celula: numero de passos ate o objetivo (NF1).
+def mapa_brushfire(livre):
+    """Algoritmo Brushfire: espalhamento a partir dos obstaculos e bordas.
 
-    Busca em largura 8-conectada a partir do objetivo, sem cortar canto
-    de celula ocupada -- a mesma conectividade da busca A*. O objetivo
-    vale 0 e cada anel seguinte vale um a mais; descer esse campo celula
-    a celula leva ao objetivo, e por isso ele e o 'potencial discreto'
-    do metodo de grid, sem minimos locais espurios.
+    Calcula, por busca em largura (BFS 8-conectada), a distancia em passos
+    de grade de cada celula livre ate a celula ocupada (obstaculo inflado
+    ou parede da mesa) mais proxima:
+      - 0 nas celulas ocupadas;
+      - 1 nas celulas livres adjacentes a obstaculos ou a borda do grid;
+      - 2, 3, ... conforme se afasta dos obstaculos.
 
-    Devolve uma matriz int com -1 nas celulas ocupadas ou inalcancaveis.
+    Esse mapa de distancias discretas alimenta o campo de potencial
+    repulsivo usado pelo A* para manter o robo afastado dos obstaculos.
     """
+    altura, largura = livre.shape
+    dist = np.full(livre.shape, -1, dtype=int)
+    fila = []
+
+    for i in range(altura):
+        for j in range(largura):
+            if not livre[i, j]:
+                dist[i, j] = 0
+                fila.append((i, j))
+
+    # As bordas externas do grid tambem contam como fronteira do workspace
+    for i in range(altura):
+        for j in range(largura):
+            if livre[i, j] and (i == 0 or i == altura - 1 or j == 0 or j == largura - 1):
+                dist[i, j] = 1
+                fila.append((i, j))
+
+    head = 0
+    while head < len(fila):
+        i, j = fila[head]
+        head += 1
+        d_atual = dist[i, j]
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                if di == 0 and dj == 0:
+                    continue
+                ni, nj = i + di, j + dj
+                if 0 <= ni < altura and 0 <= nj < largura and dist[ni, nj] < 0:
+                    dist[ni, nj] = d_atual + 1
+                    fila.append((ni, nj))
+
+    # Caso nao haja nenhum obstaculo/borda
+    dist[dist < 0] = max(altura, largura)
+    return dist
+
+
+def potencial_repulsivo_brushfire(brushfire, passo, d0=0.18, peso_rep=6.0):
+    """Converte o mapa Brushfire em um campo de potencial repulsivo no grid.
+
+    Para cada celula com distancia d_m = brushfire * passo < d0:
+        U_rep(c) = peso_rep * ((1/d_m - 1/d0) / (1/passo - 1/d0))^2
+    Celulas com d_m >= d0 tem U_rep = 0. Celulas ocupadas recebem Inf.
+    """
+    pot = np.zeros(brushfire.shape, dtype=float)
+    pot[brushfire <= 0] = np.inf
+    if d0 <= passo or peso_rep <= 0.0:
+        return pot
+
+    d_m = brushfire.astype(float) * passo
+    ativo = (brushfire > 0) & (d_m < d0)
+    if np.any(ativo):
+        escala_max = (1.0 / passo) - (1.0 / d0)
+        eta = (1.0 / d_m[ativo]) - (1.0 / d0)
+        pot[ativo] = peso_rep * ((eta / escala_max) ** 2)
+    return pot
+
+
+def mapa_wavefront(livre, objetivo_ij):
+    """Wavefront (NF1) a partir do objetivo para visualizacao do campo na figura."""
     valores = np.full(livre.shape, -1, dtype=int)
     altura, largura = livre.shape
     if not livre[objetivo_ij]:
@@ -477,7 +473,7 @@ def mapa_wavefront(livre, objetivo_ij):
                     if not livre[a, b] or valores[a, b] >= 0:
                         continue
                     if di and dj and not (livre[a, j] and livre[i, b]):
-                        continue  # nao corta canto
+                        continue
                     valores[a, b] = v_atual + 1
                     proxima.append((a, b))
         fila = proxima
@@ -519,15 +515,17 @@ def _celula_livre_mais_proxima(celula, livre):
     return None
 
 
-def busca_a_estrela(livre, inicio_ij, objetivo_ij):
-    """A* 8-conectado sobre as celulas livres.
+def busca_a_estrela(livre, inicio_ij, objetivo_ij, campo_repulsivo=None):
+    """A* 8-conectado sobre o Grid guiado pelo Campo de Potencial (Brushfire).
 
-    Custo 1 nos passos ortogonais e sqrt(2) nos diagonais, com a
-    distancia octil como heuristica -- admissivel e consistente, logo o
-    caminho em celulas e otimo. Diagonais que cortariam o canto de uma
-    celula ocupada sao proibidas.
-
-    Devolve a lista de celulas [(i, j), ...] ou None se nao ha caminho.
+    O custo de transicao para uma celula vizinha combina a distancia
+    geometrica do passo (1 ou sqrt(2)) com o potencial repulsivo do
+    Brushfire naquela celula:
+        custo_passo = peso_geometrico * (1.0 + campo_repulsivo[v])
+    E a heuristica h(c) e a distancia octil ate o objetivo (potencial
+    atrativo). Assim o A* encontra o menor caminho que simultaneamente
+    se mantem afastado dos obstaculos e das bordas da mesa, sem sofrer
+    com minimos locais.
     """
     altura, largura = livre.shape
     raiz2 = np.sqrt(2.0)
@@ -566,8 +564,9 @@ def busca_a_estrela(livre, inicio_ij, objetivo_ij):
             if not livre[v] or v in fechados:
                 continue
             if di and dj and not (livre[i + di, j] and livre[i, j + dj]):
-                continue  # nao corta canto
-            novo = custo + peso
+                continue  # nao corta canto de celula ocupada
+            rep = float(campo_repulsivo[v]) if campo_repulsivo is not None else 0.0
+            novo = custo + peso * (1.0 + rep)
             if novo < g.get(v, np.inf):
                 g[v] = novo
                 veio_de[v] = atual
@@ -575,8 +574,8 @@ def busca_a_estrela(livre, inicio_ij, objetivo_ij):
     return None
 
 
-def _visada_livre(a, b, livre, origem, passo):
-    """Verdadeiro se o segmento ab so atravessa celulas livres."""
+def _visada_livre(a, b, livre, origem, passo, brushfire=None, min_bf=1):
+    """Verdadeiro se o segmento ab atravessa apenas celulas com brushfire >= min_bf."""
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
     n = int(np.ceil(np.linalg.norm(b - a) / (0.5 * passo))) + 1
@@ -584,15 +583,18 @@ def _visada_livre(a, b, livre, origem, passo):
         c = _celula(a + t * (b - a), origem, passo, livre.shape)
         if not livre[c]:
             return False
+        if brushfire is not None and brushfire[c] < min_bf:
+            return False
     return True
 
 
-def suavizar_caminho(pontos, livre, origem, passo):
-    """Remove os degraus do caminho por atalhos em linha de visada.
+def suavizar_caminho(pontos, livre, origem, passo, brushfire=None, bf_seguro=4):
+    """Remove os degraus da grade por atalhos em linha de visada segura.
 
-    Avanca pelo caminho ligando cada ponto ao vertice mais distante que
-    ainda alcanca em linha reta sem cruzar celula ocupada. Encurta o
-    caminho e tira o vies das 8 direcoes da grade.
+    Quando 'brushfire' e fornecido, um atalho entre pontos[i] e pontos[j]
+    so e aceito se nao chegar mais perto dos obstaculos do que o proprio
+    trecho original (limitado a 'bf_seguro' celulas de folga). Isso evita
+    que a suavizacao cole a trajetoria de volta na quina dos obstaculos.
     """
     if len(pontos) <= 2:
         return np.asarray(pontos, dtype=float)
@@ -601,35 +603,25 @@ def suavizar_caminho(pontos, livre, origem, passo):
     i = 0
     while i < len(pontos) - 1:
         j = len(pontos) - 1
-        while j > i + 1 and not _visada_livre(pontos[i], pontos[j],
-                                              livre, origem, passo):
+        while j > i + 1:
+            min_bf = 1
+            if brushfire is not None:
+                bfs_trecho = [
+                    int(brushfire[_celula(pontos[k], origem, passo, livre.shape)])
+                    for k in range(i, j + 1)
+                ]
+                min_bf = max(1, min(min(bfs_trecho), bf_seguro))
+            if _visada_livre(pontos[i], pontos[j], livre, origem, passo,
+                             brushfire=brushfire, min_bf=min_bf):
+                break
             j -= 1
         saida.append(pontos[j])
         i = j
     return np.asarray(saida, dtype=float)
 
 
-def reamostrar(pontos, passo_amostra):
-    """Reamostra a poligonal com espacamento aproximadamente uniforme."""
-    pontos = np.asarray(pontos, dtype=float)
-    if len(pontos) < 2:
-        return pontos
-    saida = [pontos[0]]
-    for a, b in zip(pontos[:-1], pontos[1:]):
-        d = np.linalg.norm(b - a)
-        n = max(1, int(np.ceil(d / passo_amostra)))
-        for k in range(1, n + 1):
-            saida.append(a + (b - a) * (k / n))
-    return np.asarray(saida)
-
-
 def _dentro_poligono_varios(pontos, poligono):
-    """Ray casting vetorizado: mascara dos pontos dentro do poligono.
-
-    Mesma regra de 'ponto_dentro_poligono', so que para um array de
-    pontos de uma vez -- o teste roda milhares de vezes dentro de
-    'limitar_pontos' e em Python puro ficaria lento.
-    """
+    """Ray casting vetorizado: mascara dos pontos dentro do poligono."""
     x, y = pontos[:, 0], pontos[:, 1]
     dentro = np.zeros(len(pontos), dtype=bool)
     n = len(poligono)
@@ -637,7 +629,7 @@ def _dentro_poligono_varios(pontos, poligono):
         x1, y1 = poligono[i]
         x2, y2 = poligono[(i + 1) % n]
         if y1 == y2:
-            continue  # aresta horizontal nunca cruza o raio
+            continue
         cruza = (y1 > y) != (y2 > y)
         x_cruz = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
         dentro ^= cruza & (x < x_cruz)
@@ -645,11 +637,7 @@ def _dentro_poligono_varios(pontos, poligono):
 
 
 def _visada_poligonos(a, b, obstaculos, limites=None, passo=0.005):
-    """'_visada_livre' sem grade: testa os poligonos direto.
-
-    Usada para limitar os pontos do caminho do metodo potencial, que
-    nao constroi grade nenhuma.
-    """
+    """Testa linha de visada diretamente contra os poligonos."""
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
     n = int(np.ceil(np.linalg.norm(b - a) / passo)) + 1
@@ -672,21 +660,7 @@ def _visada_poligonos(a, b, obstaculos, limites=None, passo=0.005):
 
 
 def limitar_pontos(pontos, maximo, visada_livre):
-    """Reduz a poligonal a no maximo 'maximo' pontos, sem colidir.
-
-    Remove um vertice por vez -- sempre o que menos altera a forma do
-    caminho, isto e, o mais proximo do atalho que o substituiria -- e so
-    aceita a remocao quando esse atalho continua em linha de visada
-    livre. O inicio e o objetivo nunca saem.
-
-    E o criterio do Ramer-Douglas-Peucker com o teste de colisao no
-    meio: por isso o resultado nao e apenas parecido com o caminho
-    original, e um caminho valido.
-
-    Devolve (pontos, cabe). 'cabe' e False quando nao houve como chegar
-    a 'maximo' pontos sem cortar obstaculo; nesse caso o retorno e a
-    menor poligonal segura encontrada, e quem chama avisa.
-    """
+    """Reduz a poligonal a no maximo 'maximo' pontos, sem colidir."""
     pontos = [np.asarray(p, dtype=float) for p in pontos]
     if not maximo or maximo <= 0 or len(pontos) <= maximo:
         return np.asarray(pontos, dtype=float), True
@@ -702,7 +676,6 @@ def limitar_pontos(pontos, maximo, visada_livre):
     restantes = n
 
     def desvio(k):
-        """Distancia do vertice k ao atalho que o substituiria."""
         a, b, c = pontos[anterior[k]], pontos[k], pontos[seguinte[k]]
         return float(np.linalg.norm(b - ponto_mais_proximo_segmento(b, a, c)))
 
@@ -712,16 +685,14 @@ def limitar_pontos(pontos, maximo, visada_livre):
     while restantes > maximo and fila:
         _, v, k = heapq.heappop(fila)
         if not vivo[k] or v != versao[k]:
-            continue  # entrada velha: os vizinhos de k mudaram depois
+            continue
         a, c = anterior[k], seguinte[k]
         if not visada_livre(pontos[a], pontos[c]):
-            continue  # o atalho bateria no obstaculo; tenta o proximo
+            continue
         vivo[k] = False
         restantes -= 1
         seguinte[a] = c
         anterior[c] = a
-        # Os vizinhos passaram a ter outro atalho: reavalia os dois,
-        # inclusive se um deles ja tinha sido recusado antes.
         for m in (a, c):
             if 0 < m < n - 1 and vivo[m]:
                 versao[m] += 1
@@ -732,16 +703,7 @@ def limitar_pontos(pontos, maximo, visada_livre):
 
 
 def reamostrar_n(pontos, n):
-    """Reamostra a poligonal em exatamente n pontos.
-
-    Todos os vertices originais sao mantidos e os pontos que faltam
-    para chegar a n vao para dentro dos segmentos, os mais longos
-    primeiro. Manter os vertices e o que garante que o caminho
-    continua livre de colisao: amostrando so por comprimento de arco,
-    as quinas ficariam de fora, e a reta entre as duas amostras de
-    cada lado de uma quina corta o canto -- podendo entrar justamente
-    no obstaculo que a quina contornava.
-    """
+    """Reamostra a poligonal em exatamente n pontos mantendo os vertices."""
     pontos = np.asarray(pontos, dtype=float)
     if len(pontos) < 2 or n <= len(pontos):
         return pontos
@@ -751,9 +713,6 @@ def reamostrar_n(pontos, n):
     if total <= 0.0:
         return pontos
 
-    # Reparticao proporcional ao comprimento de cada segmento, pelo
-    # metodo dos maiores restos, para a soma bater exatamente com o
-    # numero de pontos que faltam.
     extras = n - len(pontos)
     quota = extras * distancias / total
     por_segmento = np.floor(quota).astype(int)
@@ -772,26 +731,33 @@ def reamostrar_n(pontos, n):
 
 def reduzir_pontos(pontos, livre, origem, passo,
                    minimo=MIN_PONTOS_TRAJETORIA,
-                   maximo=MAX_PONTOS_TRAJETORIA):
-    """Deixa a trajetoria com um numero de waypoints entre os limites.
-
-    Acima do maximo, 'limitar_pontos' tira os vertices um a um, e so
-    aceita tirar quando o atalho que substitui o vertice continua em
-    celulas livres -- por isso a reducao nunca introduz colisao.
-    Abaixo do minimo, 'reamostrar_n' acrescenta pontos dentro dos
-    proprios segmentos ate o alvo.
-    """
+                   maximo=MAX_PONTOS_TRAJETORIA,
+                   brushfire=None, bf_seguro=3):
+    """Garante que a trajetoria respeite o limite maximo de pontos (16 = inicio + 15 WPs)."""
     pontos = np.asarray(pontos, dtype=float)
 
     if maximo and len(pontos) > maximo:
         antes = len(pontos)
-        pontos, cabe = limitar_pontos(
-            pontos, maximo,
-            lambda a, b: _visada_livre(a, b, livre, origem, passo))
+
+        def visada_com_folga(a, b):
+            if brushfire is None:
+                return _visada_livre(a, b, livre, origem, passo)
+            ca = _celula(a, origem, passo, livre.shape)
+            cb = _celula(b, origem, passo, livre.shape)
+            folga = max(1, min(int(brushfire[ca]), int(brushfire[cb]), bf_seguro))
+            return _visada_livre(a, b, livre, origem, passo,
+                                 brushfire=brushfire, min_bf=folga)
+
+        pontos, cabe = limitar_pontos(pontos, maximo, visada_com_folga)
+        if not cabe and brushfire is not None:
+            # Se nao coube com a folga do Brushfire, relaxa para visada livre no C-space
+            pontos, cabe = limitar_pontos(
+                pontos, maximo,
+                lambda a, b: _visada_livre(a, b, livre, origem, passo))
         print(f"[OK] Trajetoria reduzida de {antes} para {len(pontos)} "
-              f"waypoints (limite {maximo})")
+              f"pontos ({len(pontos) - 1} waypoints, limite {maximo - 1} waypoints)")
         if not cabe:
-            print(f"[AVISO] Nao da para descer de {len(pontos)} waypoints "
+            print(f"[AVISO] Nao da para descer de {len(pontos)} pontos "
                   f"sem cortar obstaculo")
 
     if minimo and len(pontos) < minimo:
@@ -799,33 +765,30 @@ def reduzir_pontos(pontos, livre, origem, passo,
     return pontos
 
 
-def plan_grid(inicio, objetivo, obstaculos, limites, passo=0.01,
+def plan_grid(inicio, objetivo, obstaculos, limites, passo=0.02,
               suavizar=True, min_pontos=MIN_PONTOS_TRAJETORIA,
-              max_pontos=MAX_PONTOS_TRAJETORIA):
-    """Planejamento por decomposicao em celulas e busca A*.
+              max_pontos=MAX_PONTOS_TRAJETORIA,
+              d0_rep=0.18, peso_rep=6.0):
+    """Planejamento em Grid com Campo de Potencial (Brushfire) e busca A*.
 
-    Discretiza o workspace, acha o caminho otimo em celulas, suaviza-o
-    por linha de visada, reduz a no maximo 'max_pontos' pontos e
-    reamostra com espacamento uniforme dentro desse mesmo limite.
-    Retorna (caminho, sucesso); sucesso e False somente quando nao
-    existe caminho na resolucao pedida.
+    1. Constroi o grid de ocupacao sobre os obstaculos expandidos (Minkowski).
+    2. Calcula o mapa Brushfire (espalhamento da distancia aos obstaculos).
+    3. Gera o campo de potencial repulsivo a partir do Brushfire.
+    4. Executa o A* ponderado pelo potencial para achar o menor caminho seguro.
+    5. Suaviza e limita o caminho a no maximo 15 waypoints (16 pontos).
     """
     livre, origem = construir_grid(obstaculos, limites, passo)
+    brushfire = mapa_brushfire(livre)
+    campo_rep = potencial_repulsivo_brushfire(brushfire, passo, d0=d0_rep, peso_rep=peso_rep)
 
     inicio_ij = _celula(inicio, origem, passo, livre.shape)
     objetivo_ij = _celula(objetivo, origem, passo, livre.shape)
 
-    # O ponto pode cair numa celula marcada ocupada pelo arredondamento
-    # da rasterizacao; nesse caso parte da celula livre mais proxima.
     for nome, c in (("inicio", inicio_ij), ("objetivo", objetivo_ij)):
         if not livre[c]:
             novo = _celula_livre_mais_proxima(c, livre)
-            # So vale corrigir o arredondamento da rasterizacao: se a
-            # celula livre mais proxima esta longe, o ponto pedido e
-            # realmente inalcancavel e mover o objetivo seria resolver
-            # outro problema sem avisar.
             if novo is None or max(abs(novo[0] - c[0]),
-                                   abs(novo[1] - c[1])) > 1:
+                                   abs(novo[1] - c[1])) > 2:
                 print(f"[ERRO] O {nome} esta em regiao proibida do espaco "
                       f"de configuracoes (obstaculo inflado pelo raio do "
                       f"robo): escolha outro ponto ou reduza --raio-robo")
@@ -837,40 +800,38 @@ def plan_grid(inicio, objetivo, obstaculos, limites, passo=0.01,
             else:
                 objetivo_ij = novo
 
-    celulas = busca_a_estrela(livre, inicio_ij, objetivo_ij)
+    celulas = busca_a_estrela(livre, inicio_ij, objetivo_ij, campo_repulsivo=campo_rep)
     n_livres = int(livre.sum())
     print(f"[OK] Grade {livre.shape[1]}x{livre.shape[0]} celulas de "
           f"{passo} m ({n_livres} livres, "
-          f"{livre.size - n_livres} ocupadas)")
+          f"{livre.size - n_livres} ocupadas, "
+          f"Brushfire max={brushfire.max()} celulas)")
     if celulas is None:
         print("[AVISO] Nao existe caminho na resolucao pedida "
               "(tente --passo menor ou --margem menor)")
         return np.array([np.asarray(inicio, dtype=float)]), False
 
-    # Pontos reais: inicio exato, centros das celulas, objetivo exato.
     pontos = [np.asarray(inicio, dtype=float)]
     pontos += [_centro(c, origem, passo) for c in celulas]
     pontos.append(np.asarray(objetivo, dtype=float))
 
+    bf_seguro = max(2, int(round(0.5 * d0_rep / passo))) if d0_rep > 0 else 1
     if suavizar:
-        pontos = suavizar_caminho(pontos, livre, origem, passo)
+        pontos = suavizar_caminho(pontos, livre, origem, passo,
+                                  brushfire=brushfire, bf_seguro=bf_seguro)
     pontos = np.asarray(pontos, dtype=float)
 
     if max_pontos or min_pontos:
         pontos = reduzir_pontos(pontos, livre, origem, passo,
-                                minimo=min_pontos, maximo=max_pontos)
+                                minimo=min_pontos, maximo=max_pontos,
+                                brushfire=brushfire, bf_seguro=bf_seguro)
     return pontos, True
 
 
 # ------------------------------------------------------------------- mapa
 
 def carregar_mapa(caminho_json):
-    """Le obstaculos, limites e pose do robo do JSON de 'gerar_mapa.py'.
-
-    Devolve (obstaculos, limites, robo). 'robo' e o dicionario do bloco
-    'robo' do JSON -- a pose medida pela camera, usada como ponto
-    inicial -- ou None quando o mapa nao traz esse bloco.
-    """
+    """Le obstaculos, limites e pose do robo do JSON de 'gerar_mapa.py'."""
     with open(caminho_json, "r", encoding="utf-8") as f:
         dados = json.load(f)
 
@@ -880,8 +841,6 @@ def carregar_mapa(caminho_json):
     ]
     limites = dados.get("workspace_limites_m", {})
 
-    # Contorno real da mesa (interior da fita preta), medido na calibracao:
-    # os planejadores nao deixam o robo sair dele.
     contorno = dados.get("workspace_contorno_xy_m")
     if contorno and limites:
         limites["contorno"] = np.array(contorno, dtype=float)
@@ -902,20 +861,11 @@ def mapa_exemplo():
         poligono_regular((0.3, 0.3), 4, 0.08),
         poligono_regular((0.7, 0.5), 3, 0.10),
         poligono_regular((0.5, 0.65), 6, 0.09),
-
     ], {"x_min": 0.0, "x_max": 1.2, "y_min": 0.0, "y_max": 0.8}, None
 
 
 def plotar_valores(caminho, obstaculos, inicio, objetivo, grid, arquivo):
-    """Desenha a grade como tabela: o valor escrito dentro de cada celula.
-
-    Celula ocupada (ou inalcancavel a partir do objetivo) aparece como
-    'Inf', como e usual no wavefront. As celulas por onde a trajetoria
-    passa ficam realcadas, e as do inicio e do objetivo tambem.
-
-    So faz sentido numa grade grossa; com celulas pequenas os numeros
-    nao cabem e 'plotar' desenha o campo em cores.
-    """
+    """Desenha a grade como tabela com o valor em cada celula."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -957,13 +907,11 @@ def plotar_valores(caminho, obstaculos, inicio, objetivo, grid, arquivo):
             ax.text(x + passo / 2, y + passo / 2, texto, ha="center",
                     va="center", fontsize=6.5, color=cor_texto, zorder=1)
 
-    # Contorno real dos obstaculos sobre a grade, para ver o quanto a
-    # discretizacao distorce a geometria.
     for poligono in obstaculos:
         ax.add_patch(Polygon(poligono, closed=True, fill=False,
                              edgecolor="k", lw=1.6, zorder=2))
 
-    ax.plot(caminho[:, 0], caminho[:, 1], "-b", lw=2.0, zorder=3)
+    ax.plot(caminho[:, 0], caminho[:, 1], "-b", marker="o", ms=5, lw=2.0, zorder=3)
     ax.plot(*inicio, "go", ms=9, mec="k", zorder=4)
     ax.plot(*objetivo, "r*", ms=15, mec="k", zorder=4)
 
@@ -972,7 +920,7 @@ def plotar_valores(caminho, obstaculos, inicio, objetivo, grid, arquivo):
     ax.set_aspect("equal")
     ax.set_xlabel("x [m]")
     ax.set_ylabel("y [m]")
-    ax.set_title(f"valores da grade (wavefront) - celula de {passo} m",
+    ax.set_title(f"valores da grade (brushfire/wavefront) - celula de {passo} m",
                  fontsize=10)
     fig.savefig(arquivo, dpi=130, bbox_inches="tight")
     plt.close(fig)
@@ -981,13 +929,7 @@ def plotar_valores(caminho, obstaculos, inicio, objetivo, grid, arquivo):
 
 def plotar(caminho, obstaculos, expandidos, inicio, objetivo, limites,
            arquivo, grid=None):
-    """Desenha mapa e trajetoria; com 'grid', mostra os pontos da grade.
-
-    'grid' e a tupla (livre, origem, passo, valores): cada celula vira
-    um ponto no seu centro, azul se livre e vermelho se ocupada, e
-    'valores' (wavefront, ou None) pinta o campo de fundo e escreve o
-    valor em cada celula quando a grade e grossa o bastante.
-    """
+    """Desenha mapa, expansao de Minkowski, campo potencial do grid e trajetoria."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1009,19 +951,16 @@ def plotar(caminho, obstaculos, expandidos, inicio, objetivo, limites,
         ]
 
         if valores is not None:
-            # Campo de valores (wavefront) como fundo; as celulas
-            # ocupadas ou inalcancaveis ficam transparentes.
             campo = np.ma.masked_less(valores, 0)
             imagem = ax.imshow(
                 campo, origin="lower", zorder=-1, cmap="viridis", alpha=0.75,
                 extent=(origem[0], origem[0] + largura * passo,
                         origem[1], origem[1] + altura * passo))
             barra = fig.colorbar(imagem, ax=ax, fraction=0.046, pad=0.04)
-            barra.set_label("valor da celula (passos ate o objetivo)",
+            barra.set_label("campo no grid (passos ate o objetivo / brushfire)",
                             fontsize=8)
             barra.ax.tick_params(labelsize=7)
 
-            # O numero so cabe quando a grade e grossa.
             if campo.count() <= 400:
                 for i in range(altura):
                     for j in range(largura):
@@ -1037,15 +976,14 @@ def plotar(caminho, obstaculos, expandidos, inicio, objetivo, limites,
             ax.add_patch(Polygon(
                 poligono, closed=True, facecolor="0.85", edgecolor="r",
                 ls="--", lw=1.2,
-                label="margem de seguranca" if i == 0 else None))
+                label="expansao Minkowski" if i == 0 else None))
     for i, poligono in enumerate(obstaculos):
-        # Com a grade visivel, o preenchimento fica translucido para
-        # nao esconder as celulas ocupadas.
         ax.add_patch(Polygon(poligono, closed=True, facecolor="0.6",
                              edgecolor="k",
                              alpha=0.45 if grid is not None else 1.0,
                              label="obstaculo" if i == 0 else None))
-    ax.plot(caminho[:, 0], caminho[:, 1], "-b", lw=2, label="trajetoria")
+    ax.plot(caminho[:, 0], caminho[:, 1], "-bo", ms=5, lw=2,
+            label=f"trajetoria ({len(caminho) - 1} waypoints)")
     ax.plot(*inicio, "go", ms=10, label="inicio")
     ax.plot(*objetivo, "r*", ms=15, label="objetivo")
     contorno_mesa = limites_mesa.contorno_de_limites(limites)
@@ -1054,37 +992,97 @@ def plotar(caminho, obstaculos, expandidos, inicio, objetivo, limites,
                              edgecolor="m", lw=2, label="limite da mesa"))
     ax.set_xlim(limites.get("x_min", 0.0), limites.get("x_max", 1.2))
     ax.set_ylim(limites.get("y_min", 0.0), limites.get("y_max", 0.8))
+    if limites.get("origem") == "superior_esquerdo":
+        ax.invert_yaxis()
     ax.set_aspect("equal")
     ax.set_xlabel("x [m]")
     ax.set_ylabel("y [m]")
     if grid is not None:
-        # O ponto so fica legivel se for menor que o espacamento real
-        # da grade na figura, que depende do tamanho dos eixos.
         fig.canvas.draw()
         caixa = ax.get_window_extent()
-        pts_por_m = (caixa.height / (ax.get_ylim()[1] - ax.get_ylim()[0])
-                     * 72.0 / fig.dpi)
+        dy_lim = abs(ax.get_ylim()[1] - ax.get_ylim()[0])
+        pts_por_m = (caixa.height / max(dy_lim, 1e-6)) * 72.0 / fig.dpi
         for artista in pontos_grid:
             artista.set_markersize(max(0.3, 0.45 * pts_por_m * passo))
 
     legenda = ax.legend(loc="best", fontsize=8)
     if grid is not None:
-        # Na legenda os mesmos pontos precisam ser visiveis.
         handles = getattr(legenda, "legend_handles",
                           getattr(legenda, "legendHandles", []))
         for handle in handles[:len(pontos_grid)]:
             handle.set_markersize(7)
     ax.grid(True, alpha=0.3)
     fig.savefig(arquivo, dpi=120, bbox_inches="tight")
+    plt.close(fig)
     print(f"[OK] Figura salva em '{arquivo}'")
 
 
+def plotar_opencv(caminho, obstaculos, expandidos, inicio, objetivo, limites,
+                  arquivo, grid=None):
+    """Fallback para gerar a figura usando OpenCV quando matplotlib nao esta instalado."""
+    import cv2
 
-#-------------------------------------------------- Comandos do ROBO
+    x_min = float(limites.get("x_min", 0.0))
+    x_max = float(limites.get("x_max", 2.5))
+    y_min = float(limites.get("y_min", 0.0))
+    y_max = float(limites.get("y_max", 1.21))
+    ppm = 420.0
+    largura_px = max(200, int(round((x_max - x_min) * ppm)))
+    altura_px = max(200, int(round((y_max - y_min) * ppm)))
+    sup_esq = limites.get("origem") == "superior_esquerdo"
 
-# ---------------------------------------------------------------------------
-# Conexão
-# ---------------------------------------------------------------------------
+    img = np.full((altura_px, largura_px, 3), 245, dtype=np.uint8)
+
+    def para_px(pts):
+        pts = np.asarray(pts, dtype=float).reshape(-1, 2)
+        px = np.round((pts[:, 0] - x_min) * ppm).astype(np.int32)
+        if sup_esq:
+            py = np.round((pts[:, 1] - y_min) * ppm).astype(np.int32)
+        else:
+            py = np.round((y_max - pts[:, 1]) * ppm).astype(np.int32)
+        return np.column_stack([px, py])
+
+    if grid is not None:
+        livre, origem, passo, valores = grid
+        gh, gw = livre.shape
+        for i in range(gh):
+            for j in range(gw):
+                c_xy = origem + (np.array([j, i]) + 0.5) * passo
+                p = para_px(c_xy)[0]
+                cor = (225, 195, 150) if livre[i, j] else (140, 140, 220)
+                cv2.circle(img, (int(p[0]), int(p[1])), 2, cor, -1)
+
+    for pol in expandidos:
+        pts_px = para_px(pol)
+        cv2.fillPoly(img, [pts_px], (220, 220, 235))
+        cv2.polylines(img, [pts_px], True, (0, 0, 220), 2)
+
+    for pol in obstaculos:
+        pts_px = para_px(pol)
+        cv2.fillPoly(img, [pts_px], (145, 145, 145))
+        cv2.polylines(img, [pts_px], True, (20, 20, 20), 2)
+
+    contorno_mesa = limites_mesa.contorno_de_limites(limites)
+    if contorno_mesa is not None:
+        cv2.polylines(img, [para_px(contorno_mesa)], True, (200, 0, 200), 2)
+
+    if len(caminho) >= 2:
+        cam_px = para_px(caminho)
+        cv2.polylines(img, [cam_px], False, (220, 60, 0), 3)
+        for p in cam_px[1:-1]:
+            cv2.circle(img, (int(p[0]), int(p[1])), 5, (180, 0, 0), -1)
+
+    ini_px = para_px(inicio)[0]
+    obj_px = para_px(objetivo)[0]
+    cv2.circle(img, (int(ini_px[0]), int(ini_px[1])), 8, (0, 180, 0), -1)
+    cv2.circle(img, (int(obj_px[0]), int(obj_px[1])), 8, (0, 0, 230), -1)
+
+    cv2.imwrite(arquivo, img)
+    print(f"[OK] Figura salva em '{arquivo}' (via OpenCV)")
+
+
+# ------------------------------------------- Comunicacao com o Robo (demo.py)
+
 def list_ports():
     ports = serial.tools.list_ports.comports()
     if not ports:
@@ -1101,9 +1099,7 @@ def connect(port=DEFAULT_PORT, baud=DEFAULT_BAUD):
     ser.reset_input_buffer()
     return ser
 
-# ---------------------------------------------------------------------------
-# Envio e leitura
-# ---------------------------------------------------------------------------
+
 def send(ser, cmd):
     ser.write(f"<{cmd}>\n".encode("ascii"))
     ser.flush()
@@ -1129,13 +1125,9 @@ def cmd_and_wait(ser, cmd, timeout=RESPONSE_TIMEOUT_S):
     send(ser, cmd)
     return read_response(ser, timeout)
 
-# ---------------------------------------------------------------------------
-# Waypoints
-# ---------------------------------------------------------------------------
-def add_waypoint(ser, x, y, th=None):
-    if th is not None:
-        return cmd_and_wait(ser, f"A,{x:.3f},{y:.3f},{th:.1f}")
-    return cmd_and_wait(ser, f"A,{x:.3f},{y:.3f}")
+
+def add_waypoint(ser, x, y, th=0.0):
+    return cmd_and_wait(ser, f"A,{x:.3f},{y:.3f},{th:.1f}")
 
 
 def set_waypoints(ser, pts):
@@ -1143,10 +1135,9 @@ def set_waypoints(ser, pts):
         return cmd_and_wait(ser, "C")
     body = f"W,{len(pts)}"
     for pt in pts:
-        if len(pt) >= 3:
-            body += f",{pt[0]:.3f},{pt[1]:.3f},{pt[2]:.1f}"
-        else:
-            body += f",{pt[0]:.3f},{pt[1]:.3f}"
+        x, y = float(pt[0]), float(pt[1])
+        th = float(pt[2]) if len(pt) >= 3 else 0.0
+        body += f",{x:.3f},{y:.3f},{th:.1f}"
     return cmd_and_wait(ser, body)
 
 
@@ -1155,10 +1146,9 @@ def append_waypoints(ser, pts):
         return None
     body = f"Q,{len(pts)}"
     for pt in pts:
-        if len(pt) >= 3:
-            body += f",{pt[0]:.3f},{pt[1]:.3f},{pt[2]:.1f}"
-        else:
-            body += f",{pt[0]:.3f},{pt[1]:.3f}"
+        x, y = float(pt[0]), float(pt[1])
+        th = float(pt[2]) if len(pt) >= 3 else 0.0
+        body += f",{x:.3f},{y:.3f},{th:.1f}"
     return cmd_and_wait(ser, body)
 
 
@@ -1170,9 +1160,10 @@ def list_waypoints(ser):
     n = int(parts[0])
     wps = []
     for i in range(n):
-        x = float(parts[1 + 2 * i])
-        y = float(parts[2 + 2 * i])
-        wps.append((x, y))
+        x = float(parts[1 + 3 * i])
+        y = float(parts[2 + 3 * i])
+        th = float(parts[3 + 3 * i])
+        wps.append((x, y, th))
     return wps
 
 
@@ -1180,12 +1171,10 @@ def delete_waypoint(ser, idx):
     return cmd_and_wait(ser, f"D,{idx}")
 
 
-def replace_waypoint(ser, idx, x, y):
-    return cmd_and_wait(ser, f"S,{idx},{x:.3f},{y:.3f}")
+def replace_waypoint(ser, idx, x, y, th=0.0):
+    return cmd_and_wait(ser, f"S,{idx},{x:.3f},{y:.3f},{th:.1f}")
 
-# ---------------------------------------------------------------------------
-# Execução
-# ---------------------------------------------------------------------------
+
 def start(ser, wait_auto_eq=True):
     resp = cmd_and_wait(ser, "R")
     if resp is None:
@@ -1201,6 +1190,11 @@ def start(ser, wait_auto_eq=True):
 
 def stop(ser):
     return cmd_and_wait(ser, "C")
+
+
+def goto(ser, x, y, th=0.0):
+    return cmd_and_wait(ser, f"G,{x:.3f},{y:.3f},{th:.1f}")
+
 
 def set_pose(ser, x, y, th):
     return cmd_and_wait(ser, f"O,{x:.3f},{y:.3f},{th:.1f}")
@@ -1240,7 +1234,7 @@ def format_telemetry(t):
     )
 
 
-def wait_until_done_telemetry(ser, poll_s=0.4, timeout_s=90.0):
+def wait_until_done_telemetry(ser, poll_s=0.4, timeout_s=120.0):
     """Monitora via <T> até pos_state == DONE (2) ou timeout."""
     t0 = time.time()
     last_wp = -1
@@ -1260,94 +1254,80 @@ def wait_until_done_telemetry(ser, poll_s=0.4, timeout_s=90.0):
     return False, None
 
 
-def detectar_pose_camera(cam_arg, calib_arq="calibracao_mesa.json"):
-    """Captura um frame da camera e devolve o dict do robo (x_m, y_m, theta_graus...) ou None.
+def compensar_deriva_odometria(pos_ini, waypoints, fator_escala=1.0,
+                               comp_angular_graus=0.0):
+    """Pre-compensa erros sistematicos da odometria interna do robo sem camera.
 
-    Reproduz as etapas de gerar_mapa.processar_mapa que importam para achar o robo:
-    cantos calibrados -> escala -> retificacao -> mascara da fita -> deteccao HSV.
+    - 'fator_escala' (< 1.0 quando o robo passa do objetivo): encurta cada
+      segmento enviado ao firmware para que o deslocamento fisico real bata
+      com a distancia planejada no mapa.
+    - 'comp_angular_graus': gira os vetores de deslocamento em torno de
+      pos_ini para compensar eventual tendencia sistematica do robo de
+      puxar para a esquerda ou direita durante a caminhada.
     """
-    import cv2
-    import gerar_mapa as gm
+    wps = np.asarray(waypoints, dtype=float).copy()
+    if len(wps) == 0:
+        return wps
 
-    cfg = gm.ConfigMapa(sem_gui=True)
-    if not gm.carregar_calibracao(calib_arq, cfg):
-        print(f"[ERRO] Calibracao '{calib_arq}' nao encontrada; malha fechada indisponivel.")
-        return None
-    frame = gm.capturar_frame(cam_arg)
-    alt_img, larg_img = frame.shape[:2]
-    sx = sy = 1.0
-    if cfg.largura_camera_px > 0 and cfg.altura_camera_px > 0:
-        sx = larg_img / cfg.largura_camera_px
-        sy = alt_img / cfg.altura_camera_px
+    vetores = wps - pos_ini
+    if abs(fator_escala - 1.0) > 1e-6:
+        vetores = vetores * float(fator_escala)
 
-    cantos = np.array(cfg.cantos_calibrados, dtype="float32")
-    cantos[:, 0] *= sx
-    cantos[:, 1] *= sy
-    escala = gm.calcular_escala_cantos_px(cantos, cfg.largura_mesa_m, cfg.altura_mesa_m)
-    cfg.pixels_por_metro = escala["pixels_por_metro"]
-    cfg.metros_por_pixel = escala["metros_por_pixel"]
+    if abs(comp_angular_graus) > 1e-6:
+        ang = np.radians(float(comp_angular_graus))
+        c, s = np.cos(ang), np.sin(ang)
+        R = np.array([[c, -s], [s, c]], dtype=float)
+        vetores = vetores @ R.T
 
-    mesa_ret = gm.retificar_mesa(frame, cantos, cfg)
-    mascara_mesa = None
-    if cfg.contorno_mesa_px is not None:
-        contorno = np.array(cfg.contorno_mesa_px, dtype="float32")
-        contorno[:, 0] *= sx
-        contorno[:, 1] *= sy
-        contorno_ret = gm.aplicar_homografia(contorno, gm.matriz_retificacao(cantos, cfg))
-        mascara_mesa = np.zeros(mesa_ret.shape[:2], np.uint8)
-        cv2.fillPoly(mascara_mesa, [np.round(contorno_ret).astype(np.int32)], 255)
-
-    dados_robo, _ = gm.detectar_robo_hsv(mesa_ret, cfg, mascara_mesa)
-    return dados_robo
+    return pos_ini + vetores
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Gera trajetoria por decomposicao em celulas (grid) "
-                    "ou por campos potenciais.")
+        description="Gera trajetoria por Campos de Potencial em Grid "
+                    "(Brushfire + A* + Minkowski) e envia ao robo.")
     ap.add_argument("--mapa", default="mapa_obstaculos.json")
-    # Por padrao o inicio e a pose do robo medida pela camera, gravada
-    # no bloco 'robo' do mapa; --inicio sobrescreve.
     ap.add_argument("--inicio", type=float, nargs=2, default=None,
                     help="ponto inicial [m]; o padrao e a pose do robo "
                          "lida do mapa")
-    # (1.1, 0.7) do mapa antigo caiu dentro de um obstaculo no
-    # mapa atual (workspace 1.2 x 0.8 m).
-    ap.add_argument("--objetivo", type=float, nargs=2, default=[1.1, 0.4])
+    ap.add_argument("--objetivo", type=float, nargs=2, default=[0.7, 0.6],
+                    help="ponto objetivo [x y] em metros (padrao: 0.7 0.6)")
     ap.add_argument("--metodo", choices=("grid", "potencial"), default="grid",
-                    help="grid: A* sobre grade de ocupacao (padrao); "
-                         "potencial: descida de gradiente")
+                    help="grid: Brushfire + Potencial + A* sobre grade (padrao); "
+                         "potencial: descida de gradiente continua")
     ap.add_argument("--passo", type=float, default=0.02,
-                    help="[grid] lado da celula da grade [m]")
+                    help="[grid] lado da celula da grade [m] (padrao 0.02)")
     ap.add_argument("--sem-suavizar", action="store_true",
                     help="[grid] mantem o caminho em degraus da grade")
     ap.add_argument("--min-pontos", type=int,
                     default=MIN_PONTOS_TRAJETORIA,
-                    help=f"[grid] minimo de pontos da trajetoria (padrao "
-                         f"{MIN_PONTOS_TRAJETORIA}); 0 nao completa")
+                    help=f"minimo de pontos da trajetoria (padrao "
+                         f"{MIN_PONTOS_TRAJETORIA}); 0 nao subdivide retas")
     ap.add_argument("--max-pontos", type=int,
                     default=MAX_PONTOS_TRAJETORIA,
-                    help=f"maximo de pontos da trajetoria, contando o "
-                         f"inicio e o objetivo (padrao "
-                         f"{MAX_PONTOS_TRAJETORIA}); 0 remove o limite")
+                    help=f"maximo de pontos contando o inicio (padrao "
+                         f"{MAX_PONTOS_TRAJETORIA} = inicio + {MAX_WAYPOINTS_ROBO} waypoints)")
+    ap.add_argument("--d0", type=float, default=0.15,
+                    help="raio de influencia do campo repulsivo (Brushfire) [m] (padrao 0.18)")
+    ap.add_argument("--peso-rep", type=float, default=5.0,
+                    help="[grid] ganho do potencial repulsivo do Brushfire no A* (padrao 6.0)")
     ap.add_argument("--k-attr", type=float, default=1.0)
     ap.add_argument("--k-rep", type=float, default=0.001)
-    ap.add_argument("--d0", type=float, default=0.08,
-                    help="raio de influencia do campo repulsivo [m]")
-    ap.add_argument("--raio-robo", type=float, default=0.14,
-                    help="raio do robo [m]; infla os obstaculos pela soma "
-                         "de Minkowski (padrao 0.14 m = largura real das rodas + folga)")
-    ap.add_argument("--margem", type=float, default=0.0,
-                    help="folga de seguranca [m] somada ao raio do robo")
-    ap.add_argument("--fator-odometria", type=float, default=1.0,
-                    help="fator de escala aplicado aos deslocamentos enviados ao robo "
-                         "(ex: 0.85 se o robo anda ~18%% a mais do que o comandado)")
+    ap.add_argument("--raio-robo", type=float, default=0.07,
+                    help="raio do robo [m] para a Soma de Minkowski (padrao 0.14)")
+    ap.add_argument("--margem", type=float, default=0.04,
+                    help="folga extra de seguranca [m] somada ao raio do robo (padrao 0.02)")
+    ap.add_argument("--fator-odometria", type=float, default=0.88,
+                    help="fator de escala aplicado aos deslocamentos para evitar que o robo "
+                         "passe do objetivo (padrao 0.88; use 1.0 para desativar)")
+    ap.add_argument("--comp-angular-graus", type=float, default=0.0,
+                    help="compensacao angular (graus) aplicada aos waypoints para corrigir "
+                         "tendencia lateral da odometria (padrao 0.0)")
+    ap.add_argument("--inverter-y-robo", action="store_true",
+                    help="inverte o sinal de dy e theta enviados ao robo caso o firmware use "
+                         "eixo Y oposto ao do mapa")
     ap.add_argument("--sem-telemetria", action="store_true",
                     help="nao aguarda/monitora a telemetria <T> apos iniciar a navegacao")
-    ap.add_argument("--malha-fechada", action="store_true",
-                    help="envia 1 waypoint por vez e corrige a pose (x, y, theta) via camera (--cam) a cada parada")
-    ap.add_argument("--cam", type=str, nargs="?", const="Iriun", default=None,
-                    help="camera usada no modo --malha-fechada (padrao: Iriun ou indice como 0)")
     ap.add_argument("--alpha", type=float, default=0.02)
     ap.add_argument("--max-iter", type=int, default=5000)
     ap.add_argument("--saida", default="trajetoria.json")
@@ -1355,10 +1335,18 @@ def main():
     ap.add_argument("--sem-envio", action="store_true",
                     help="so gera a trajetoria e a figura, sem abrir a "
                          "porta serial nem enviar waypoints")
-    ap.add_argument("--port", default=DEFAULT_PORT, help="Porta serial utilizada para a comunicação com a placa")
-    ap.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="Baudrate utilizado  para a comunicação com a placa")
+    ap.add_argument("--port", default=DEFAULT_PORT,
+                    help="Porta serial utilizada para a comunicacao com o robo")
+    ap.add_argument("--baud", type=int, default=DEFAULT_BAUD,
+                    help="Baudrate utilizado para a comunicacao com o robo")
 
     args = ap.parse_args()
+
+    # Garante a restricao do professor: no maximo 15 waypoints alem do ponto inicial
+    if args.max_pontos <= 0 or args.max_pontos > MAX_PONTOS_TRAJETORIA:
+        print(f"[INFO] Ajustando --max-pontos para {MAX_PONTOS_TRAJETORIA} "
+              f"(1 ponto inicial + {MAX_WAYPOINTS_ROBO} waypoints maximos).")
+        args.max_pontos = MAX_PONTOS_TRAJETORIA
 
     ser = None
     try:
@@ -1386,33 +1374,28 @@ def main():
         print(f"[OK] Inicio lido do mapa: {args.inicio} "
               + (f"(theta {theta} graus)" if theta is not None else ""))
 
-    # Espaco de configuracoes: obstaculos inflados pelo raio do robo
-    # (mais a folga pedida), para o robo voltar a ser um ponto.
+    # Soma de Minkowski: obstaculos inflados pelo raio do robo + margem
     raio = args.raio_robo + args.margem
     expandidos = expandir_obstaculos(obstaculos, raio, limites)
     limites_c = encolher_limites(limites, raio)
     if raio > 0:
-        print(f"[OK] Obstaculos inflados por {raio} m "
+        print(f"[OK] Obstaculos inflados por {raio:.3f} m "
               f"(robo {args.raio_robo} m + folga {args.margem} m): "
               f"{len(obstaculos)} -> {len(expandidos)} poligonos")
 
     for nome, ponto in (("inicio", args.inicio), ("objetivo", args.objetivo)):
         if not limites_mesa.ponto_dentro(ponto, limites_c):
-            print(f"[ERRO] O {nome} {ponto} esta fora do limite da mesa "
-                  f"calibrada (fita preta, ja descontado o raio do robo): "
-                  f"escolha outro ponto (ou reduza --raio-robo).")
-            return
+            print(f"[AVISO] O {nome} {ponto} esta proximo da borda da mesa "
+                  f"(dentro da margem de {raio:.2f} m); ajustando para celula livre mais proxima.")
         if any(dist_ponto_poligono(np.array(ponto), o) <= 0
                for o in expandidos):
-            print(f"[ERRO] O {nome} {ponto} esta dentro de um obstaculo: "
-                  f"escolha outro ponto (ou reduza --raio-robo).")
-            return
+            print(f"[AVISO] O {nome} {ponto} toca na margem inflada de um obstaculo; "
+                  f"o planejador buscara a celula livre vizinha.")
 
-    if args.max_pontos and args.max_pontos < 2:
-        print("[ERRO] --max-pontos precisa ser 0 (sem limite) ou >= 2: "
-              "a trajetoria tem no minimo o inicio e o objetivo")
+    if args.max_pontos < 2:
+        print("[ERRO] --max-pontos precisa ser >= 2 (inicio e objetivo)")
         return
-    if args.max_pontos and args.min_pontos > args.max_pontos:
+    if args.min_pontos > args.max_pontos:
         print(f"[ERRO] --min-pontos ({args.min_pontos}) nao pode passar de "
               f"--max-pontos ({args.max_pontos})")
         return
@@ -1421,16 +1404,14 @@ def main():
         caminho, sucesso = plan_grid(
             args.inicio, args.objetivo, expandidos, limites_c,
             passo=args.passo, suavizar=not args.sem_suavizar,
-            min_pontos=args.min_pontos, max_pontos=args.max_pontos)
+            min_pontos=args.min_pontos, max_pontos=args.max_pontos,
+            d0_rep=args.d0, peso_rep=args.peso_rep)
     else:
         caminho, sucesso = plan_potencial(
             args.inicio, args.objetivo, expandidos,
             alpha=args.alpha, max_iter=args.max_iter,
             k_attr=args.k_attr, k_rep=args.k_rep, d0=args.d0,
             limites=limites_c)
-        # A descida de gradiente devolve um ponto por passo de
-        # integracao (milhares): aqui ela vira uma poligonal curta,
-        # testando cada atalho contra os obstaculos.
         if args.max_pontos and len(caminho) > args.max_pontos:
             antes = len(caminho)
             caminho, cabe = limitar_pontos(
@@ -1446,7 +1427,8 @@ def main():
     if sucesso:
         comprimento = float(np.sum(np.linalg.norm(
             np.diff(caminho, axis=0), axis=1)))
-        print(f"[OK] Objetivo alcancado: {len(caminho)} waypoints, "
+        print(f"[OK] Objetivo alcancado: {len(caminho) - 1} waypoints "
+              f"({len(caminho)} pontos contando inicio), "
               f"comprimento {comprimento:.4f} m")
     elif args.metodo == "grid":
         print("[AVISO] Nenhum caminho encontrado")
@@ -1455,29 +1437,34 @@ def main():
               f"apos {len(caminho)} passos (possivel minimo local)")
 
     theta_inicial = robo.get("theta_rad") if robo else None
+    theta_inicial_graus = robo.get("theta_graus") if robo else None
 
     with open(args.saida, "w", encoding="utf-8") as f:
         json.dump({
             "inicio_xy_m": list(args.inicio),
             "objetivo_xy_m": list(args.objetivo),
             "theta_inicial_robo_rad": theta_inicial,
+            "theta_inicial_robo_graus": theta_inicial_graus,
             "metodo": args.metodo,
             "passo_grid_m": args.passo if args.metodo == "grid" else None,
+            "d0_brushfire_m": args.d0 if args.metodo == "grid" else None,
+            "peso_rep_brushfire": args.peso_rep if args.metodo == "grid" else None,
             "sucesso": bool(sucesso),
             "num_pontos": int(len(caminho)),
-            "max_pontos": int(args.max_pontos) if args.max_pontos else None,
+            "num_waypoints": int(max(0, len(caminho) - 1)),
+            "max_waypoints": MAX_WAYPOINTS_ROBO,
             "raio_robo_m": args.raio_robo,
             "margem_seguranca_m": args.margem,
             "raio_inflado_m": raio,
+            "fator_odometria": args.fator_odometria,
             "trajetoria_xy_m": caminho.round(5).tolist(),
             "trajetoria_xytheta": [
-                [round(x, 5), round(y, 5), 0.0]
+                [round(float(x), 5), round(float(y), 5), 0.0]
                 for x, y in caminho
             ],
         }, f, indent=4)
     print(f"[OK] Trajetoria salva em '{args.saida}'")
 
-    # A grade e refeita so para a figura; o custo e desprezivel.
     grid = None
     if args.metodo == "grid":
         livre, origem = construir_grid(expandidos, limites_c, args.passo)
@@ -1488,8 +1475,6 @@ def main():
         grid = (livre, origem, args.passo, valores)
 
     try:
-        # Numa grade grossa a figura e a tabela de valores; numa grade
-        # fina os numeros nao caberiam e o campo vai em cores.
         if grid is not None and valores is not None and livre.size <= 4000:
             plotar_valores(caminho, obstaculos, args.inicio, args.objetivo,
                            grid, args.figura)
@@ -1501,80 +1486,82 @@ def main():
             plotar(caminho, obstaculos, expandidos, args.inicio,
                    args.objetivo, limites, args.figura, grid=grid)
     except ImportError:
-        print("[AVISO] matplotlib indisponivel; figura nao gerada")
+        try:
+            plotar_opencv(caminho, obstaculos, expandidos, args.inicio,
+                          args.objetivo, limites, args.figura, grid=grid)
+        except Exception as e:
+            print(f"[AVISO] matplotlib indisponivel e falha no OpenCV ({e}); figura nao gerada")
 
-    
+    # Envio para o robo usando exclusivamente a odometria interna (protocolo demo.py)
     if sucesso and ser is not None:
-        # O primeiro ponto da trajetoria e a pose atual do robo, entao
-        # nao vira waypoint. O theta de todos os waypoints e 0.0.
-        waypoints = caminho[1:].copy()
-        theta_inicial_deg = robo.get("theta_graus") if robo else None
-        if theta_inicial_deg is None and robo and "theta_rad" in robo:
-            theta_inicial_deg = float(np.degrees(robo["theta_rad"]))
-        if theta_inicial_deg is None:
-            # Sem pose do robo: assume que ele aponta para o primeiro segmento
-            d0 = caminho[1] - caminho[0] if len(caminho) > 1 else np.zeros(2)
-            theta_inicial_deg = float(np.degrees(np.arctan2(d0[1], d0[0])))
+        try:
+            waypoints = caminho[1:].copy()
+            if len(waypoints) > MAX_WAYPOINTS_ROBO:
+                waypoints = waypoints[:MAX_WAYPOINTS_ROBO]
 
-        rx = float(robo.get("x_m")) if robo else float(caminho[0, 0])
-        ry = float(robo.get("y_m")) if robo else float(caminho[0, 1])
-        pos_ini = np.array([rx, ry], dtype=float)
+            theta_inicial_deg = robo.get("theta_graus") if robo else None
+            if theta_inicial_deg is None and robo and "theta_rad" in robo:
+                theta_inicial_deg = float(np.degrees(robo["theta_rad"]))
+            if theta_inicial_deg is None:
+                d0_vec = caminho[1] - caminho[0] if len(caminho) > 1 else np.zeros(2)
+                theta_inicial_deg = float(np.degrees(np.arctan2(d0_vec[1], d0_vec[0])))
 
-        # Aplica fator de correção de escala de odometria (caso o robô ande sistematicamente mais que o comandado)
-        if abs(args.fator_odometria - 1.0) > 1e-6:
-            waypoints = pos_ini + args.fator_odometria * (waypoints - pos_ini)
-            print(f"[INFO] Fator de odometria {args.fator_odometria:.3f} aplicado aos waypoints.")
+            rx = float(robo.get("x_m")) if robo else float(caminho[0, 0])
+            ry = float(robo.get("y_m")) if robo else float(caminho[0, 1])
+            pos_ini = np.array([rx, ry], dtype=float)
 
-        if args.malha_fechada and args.cam is not None:
-            print(f"[OK] Modo MALHA FECHADA ativado com câmera '{args.cam}'.")
-            cur_x, cur_y, cur_th = rx, ry, theta_inicial_deg
-            for idx_wp, setpoint in enumerate(waypoints):
-                print(f"\n--- Etapa {idx_wp + 1}/{len(waypoints)}: indo para {setpoint.round(4).tolist()} ---")
-                stop(ser)
-                set_pose(ser, cur_x, cur_y, cur_th)
-                print(f"[INFO] Pose atual no robô: ({cur_x:.3f}, {cur_y:.3f}, {cur_th:.1f}°)")
-                add_waypoint(ser, setpoint[0], setpoint[1], 0.0)
-                ok_st, resp_st, msg_st = start(ser)
-                print(f"[INFO] Navegando: {resp_st} ({msg_st})")
-                wait_until_done_telemetry(ser)
-                time.sleep(0.4)
-                novo_robo = detectar_pose_camera(args.cam)
-                if novo_robo is not None:
-                    cur_x = float(novo_robo["x_m"])
-                    cur_y = float(novo_robo["y_m"])
-                    cur_th = float(novo_robo["theta_graus"])
-                    erro_wp = float(np.hypot(setpoint[0] - cur_x, setpoint[1] - cur_y))
-                    print(f"[CÂMERA] Pose real medida: ({cur_x:.3f}m, {cur_y:.3f}m, {cur_th:.1f}°) | Erro ao alvo: {erro_wp:.3f}m")
-            # Correção final se ainda estiver a mais de 5 cm do objetivo
-            obj_x, obj_y = float(args.objetivo[0]), float(args.objetivo[1])
-            erro_final = float(np.hypot(obj_x - cur_x, obj_y - cur_y))
-            if erro_final > 0.05:
-                print(f"\n--- Ajuste fino final para o objetivo ({obj_x:.3f}, {obj_y:.3f}) (erro={erro_final:.3f}m) ---")
-                stop(ser)
-                set_pose(ser, cur_x, cur_y, cur_th)
-                wp_corr = np.array([cur_x, cur_y]) + args.fator_odometria * np.array([obj_x - cur_x, obj_y - cur_y])
-                add_waypoint(ser, wp_corr[0], wp_corr[1], 0.0)
-                start(ser)
-                wait_until_done_telemetry(ser)
-        else:
-            print(f"[OK] Enviando {len(waypoints)} waypoints "
-                  f"({len(caminho)} pontos de trajetoria, limite "
-                  f"{args.max_pontos or 'nenhum'})")
+            # Pre-compensacao de deriva e escala da odometria interna
+            waypoints_cmd = compensar_deriva_odometria(
+                pos_ini, waypoints,
+                fator_escala=args.fator_odometria,
+                comp_angular_graus=args.comp_angular_graus
+            )
+            if abs(args.fator_odometria - 1.0) > 1e-6 or abs(args.comp_angular_graus) > 1e-6:
+                print(f"[INFO] Compensacao de odometria aplicada: "
+                      f"fator={args.fator_odometria:.3f}, "
+                      f"ang={args.comp_angular_graus:+.1f}°")
 
-            # Limpa a lista anterior de waypoints no firmware (<C>) antes de definir a pose e adicionar os novos pontos
+            # Se o firmware usar eixo Y oposto ao do mapa, espelha dy e o sinal de theta
+            if args.inverter_y_robo:
+                y_max = float(limites.get("y_max", 1.21))
+                ry_cmd = y_max - ry
+                theta_cmd_deg = -float(theta_inicial_deg)
+                waypoints_cmd[:, 1] = y_max - waypoints_cmd[:, 1]
+                print("[INFO] Eixo Y e sinal de theta invertidos para o referencial do robo.")
+            else:
+                ry_cmd = ry
+                theta_cmd_deg = float(theta_inicial_deg)
+
+            print(f"[OK] Enviando pose inicial e {len(waypoints_cmd)} waypoints "
+                  f"(maximo permitido: {MAX_WAYPOINTS_ROBO})...")
+
+            # 1. Para e limpa lista anterior (<C>)
             stop(ser)
 
-            # O firmware do robô espera o ângulo de orientação em GRAUS (e não em radianos)
-            set_pose(ser, rx, ry, theta_inicial_deg)
-            print(f"[INFO] Pose definida em ({rx:.3f}, {ry:.3f}, {theta_inicial_deg:.1f}°)")
+            # 2. Define pose inicial completa (x, y, theta_inicial em graus) via <O,x,y,th>
+            resp_pose = set_pose(ser, rx, ry_cmd, theta_cmd_deg)
+            print(f"[INFO] Pose inicial definida: <O,{rx:.3f},{ry_cmd:.3f},{theta_cmd_deg:.1f}> -> {resp_pose}")
 
-            for setpoint in waypoints:
-                add_waypoint(ser, setpoint[0], setpoint[1], 0.0)
-                print(f"[INFO] Waypoint {setpoint.round(4).tolist()} adicionado!")
-            ok_st, resp_st, msg_st = start(ser)
+            # 3. Envia lista de waypoints com theta = 0.0 via <W,n,x0,y0,0.0,...>
+            pts_envio = [(float(wp[0]), float(wp[1]), 0.0) for wp in waypoints_cmd]
+            resp_wp = set_waypoints(ser, pts_envio)
+            if resp_wp is None or not resp_wp.startswith("<OK"):
+                # Fallback: adiciona um por um via <A,x,y,0.0>
+                stop(ser)
+                set_pose(ser, rx, ry_cmd, theta_cmd_deg)
+                for i, (wx, wy, wth) in enumerate(pts_envio, 1):
+                    r_add = add_waypoint(ser, wx, wy, wth)
+                    print(f"  [WP {i:2d}/{len(pts_envio)}] ({wx:.3f}, {wy:.3f}, {wth:.1f}) -> {r_add}")
+            else:
+                for i, (wx, wy, wth) in enumerate(pts_envio, 1):
+                    print(f"  [WP {i:2d}/{len(pts_envio)}] ({wx:.3f}, {wy:.3f}, {wth:.1f})")
+                print(f"[INFO] Lista enviada via <W>: {resp_wp}")
+
+            # 4. Inicia a navegacao (<R>) e monitora telemetria interna (<T>)
+            ok_st, resp_st, msg_st = start(ser, wait_auto_eq=True)
             print(f"[INFO] Início da navegação: {resp_st} ({msg_st})")
             if ok_st and not args.sem_telemetria:
-                print("[INFO] Monitorando telemetria <T> do robô até concluir (Ctrl+C para interromper)...")
+                print("[INFO] Monitorando odometria interna via <T> até concluir (Ctrl+C para parar)...")
                 try:
                     done, last_t = wait_until_done_telemetry(ser)
                     if done and last_t is not None:
@@ -1583,6 +1570,9 @@ def main():
                 except KeyboardInterrupt:
                     print("\n[AVISO] Monitoramento interrompido pelo usuário. Enviando <C> (stop)...")
                     stop(ser)
+        finally:
+            ser.close()
+
 
 if __name__ == "__main__":
     main()
