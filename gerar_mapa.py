@@ -87,7 +87,7 @@ class ConfigMapa:
     # Origem do sistema de coordenadas (x, y) do robô:
     # True  -> Origem (0,0) no canto INFERIOR esquerdo (Padrão Cartesiano / ROS / Robótica)
     # False -> Origem (0,0) no canto SUPERIOR esquerdo (Padrão de Imagem)
-    origem_cartesiana_inferior: bool = True
+    origem_cartesiana_inferior: bool = False  # False = origem no canto superior esquerdo (eixo Y para baixo); True = origem inferior esquerda
 
     # Parâmetros de detecção dos objetos na mesa
     margem_borda_m: float = 0.02       # Ignora ruídos a menos de 2 cm da borda da mesa
