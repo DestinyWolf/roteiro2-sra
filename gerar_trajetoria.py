@@ -39,8 +39,8 @@ com pontos dentro dos segmentos quando o caminho sai curto demais,
 sempre mantendo os vertices, para o controlador receber setpoints bem
 distribuidos.
 
-'orientacoes' calcula o theta de cada ponto (a direcao do segmento que
-sai dele) e o grava no JSON.
+O robo atual nao usa o theta dos waypoints: todos sao enviados com
+theta = 0.0. Apenas o theta da pose inicial e necessario.
 """
 
 import argparse
@@ -799,23 +799,6 @@ def reduzir_pontos(pontos, livre, origem, passo,
     return pontos
 
 
-def orientacoes(pontos, theta_final=None):
-    """Theta de cada waypoint: a direcao do segmento que sai dele.
-
-    O robo e um disco, entao a orientacao nao entra no planejamento;
-    ela e so a direcao de deslocamento que o controlador deve seguir.
-    O ultimo ponto herda a orientacao do segmento que chega nele, ou
-    'theta_final' se for dado.
-    """
-    pontos = np.asarray(pontos, dtype=float)
-    if len(pontos) < 2:
-        return np.zeros(len(pontos))
-    d = np.diff(pontos, axis=0)
-    thetas = np.arctan2(d[:, 1], d[:, 0])
-    ultimo = thetas[-1] if theta_final is None else theta_final
-    return np.concatenate([thetas, [ultimo]])
-
-
 def plan_grid(inicio, objetivo, obstaculos, limites, passo=0.01,
               suavizar=True, min_pontos=MIN_PONTOS_TRAJETORIA,
               max_pontos=MAX_PONTOS_TRAJETORIA):
@@ -1471,8 +1454,6 @@ def main():
         print(f"[AVISO] Parou em {caminho[-1].round(4).tolist()} "
               f"apos {len(caminho)} passos (possivel minimo local)")
 
-    # Orientacao de cada waypoint: direcao do segmento que sai dele.
-    thetas = orientacoes(caminho)
     theta_inicial = robo.get("theta_rad") if robo else None
 
     with open(args.saida, "w", encoding="utf-8") as f:
@@ -1489,11 +1470,9 @@ def main():
             "margem_seguranca_m": args.margem,
             "raio_inflado_m": raio,
             "trajetoria_xy_m": caminho.round(5).tolist(),
-            "theta_rad": thetas.round(5).tolist(),
-            "theta_graus": np.degrees(thetas).round(2).tolist(),
             "trajetoria_xytheta": [
-                [round(x, 5), round(y, 5), round(t, 5)]
-                for (x, y), t in zip(caminho, thetas)
+                [round(x, 5), round(y, 5), 0.0]
+                for x, y in caminho
             ],
         }, f, indent=4)
     print(f"[OK] Trajetoria salva em '{args.saida}'")
@@ -1527,17 +1506,15 @@ def main():
     
     if sucesso and ser is not None:
         # O primeiro ponto da trajetoria e a pose atual do robo, entao
-        # nao vira waypoint. Para cada waypoint caminho[k+1], o angulo
-        # da reta que chega nele (caminho[k] -> caminho[k+1]) e thetas[k],
-        # isto e, thetas[:-1] (evitando desalinhamento entre a reta percorrida
-        # e o angulo th enviado ao firmware nos pontos intermediarios).
+        # nao vira waypoint. O theta de todos os waypoints e 0.0.
         waypoints = caminho[1:].copy()
-        thetas_deg = np.degrees(thetas)[:-1]
         theta_inicial_deg = robo.get("theta_graus") if robo else None
         if theta_inicial_deg is None and robo and "theta_rad" in robo:
             theta_inicial_deg = float(np.degrees(robo["theta_rad"]))
         if theta_inicial_deg is None:
-            theta_inicial_deg = float(np.degrees(thetas[0]))
+            # Sem pose do robo: assume que ele aponta para o primeiro segmento
+            d0 = caminho[1] - caminho[0] if len(caminho) > 1 else np.zeros(2)
+            theta_inicial_deg = float(np.degrees(np.arctan2(d0[1], d0[0])))
 
         rx = float(robo.get("x_m")) if robo else float(caminho[0, 0])
         ry = float(robo.get("y_m")) if robo else float(caminho[0, 1])
@@ -1551,12 +1528,12 @@ def main():
         if args.malha_fechada and args.cam is not None:
             print(f"[OK] Modo MALHA FECHADA ativado com câmera '{args.cam}'.")
             cur_x, cur_y, cur_th = rx, ry, theta_inicial_deg
-            for idx_wp, (setpoint, th_d) in enumerate(zip(waypoints, thetas_deg)):
+            for idx_wp, setpoint in enumerate(waypoints):
                 print(f"\n--- Etapa {idx_wp + 1}/{len(waypoints)}: indo para {setpoint.round(4).tolist()} ---")
                 stop(ser)
                 set_pose(ser, cur_x, cur_y, cur_th)
                 print(f"[INFO] Pose atual no robô: ({cur_x:.3f}, {cur_y:.3f}, {cur_th:.1f}°)")
-                add_waypoint(ser, setpoint[0], setpoint[1], th_d)
+                add_waypoint(ser, setpoint[0], setpoint[1], 0.0)
                 ok_st, resp_st, msg_st = start(ser)
                 print(f"[INFO] Navegando: {resp_st} ({msg_st})")
                 wait_until_done_telemetry(ser)
@@ -1575,9 +1552,8 @@ def main():
                 print(f"\n--- Ajuste fino final para o objetivo ({obj_x:.3f}, {obj_y:.3f}) (erro={erro_final:.3f}m) ---")
                 stop(ser)
                 set_pose(ser, cur_x, cur_y, cur_th)
-                th_corr = float(np.degrees(np.arctan2(obj_y - cur_y, obj_x - cur_x)))
                 wp_corr = np.array([cur_x, cur_y]) + args.fator_odometria * np.array([obj_x - cur_x, obj_y - cur_y])
-                add_waypoint(ser, wp_corr[0], wp_corr[1], th_corr)
+                add_waypoint(ser, wp_corr[0], wp_corr[1], 0.0)
                 start(ser)
                 wait_until_done_telemetry(ser)
         else:
@@ -1592,9 +1568,9 @@ def main():
             set_pose(ser, rx, ry, theta_inicial_deg)
             print(f"[INFO] Pose definida em ({rx:.3f}, {ry:.3f}, {theta_inicial_deg:.1f}°)")
 
-            for setpoint, th_d in zip(waypoints, thetas_deg):
+            for setpoint in waypoints:
                 add_waypoint(ser, setpoint[0], setpoint[1], 0.0)
-                print(f"[INFO] Waypoint {setpoint.round(4).tolist()} (th={th_d:.1f}°) adicionado!")
+                print(f"[INFO] Waypoint {setpoint.round(4).tolist()} adicionado!")
             ok_st, resp_st, msg_st = start(ser)
             print(f"[INFO] Início da navegação: {resp_st} ({msg_st})")
             if ok_st and not args.sem_telemetria:
