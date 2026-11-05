@@ -69,8 +69,8 @@ STATE_NAMES = {0: "GIRAR", 1: "ANDAR", 2: "DONE"}
 # pontos intermediarios colineares (cada parada intermediaria faz o firmware
 # trocar ANDAR -> GIRAR -> ANDAR, dando um "coice" que derrapa as rodas e
 # acumula deriva angular na odometria).
-MAX_PONTOS_TRAJETORIA = 10
-MIN_PONTOS_TRAJETORIA = 0
+MAX_PONTOS_TRAJETORIA = 15
+MIN_PONTOS_TRAJETORIA = 10
 
 # ---------------------------------------------------------------- geometria
 
