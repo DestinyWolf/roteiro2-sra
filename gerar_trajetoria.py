@@ -41,6 +41,7 @@ import serial
 import serial.tools.list_ports
 import sys
 import time
+import pose_estimation as ps
 
 DEFAULT_PORT = "/dev/ttyUSB0"
 DEFAULT_BAUD = 57600
@@ -179,165 +180,6 @@ def encolher_limites(limites, margem):
     if contorno is not None:
         encolhidos["contorno"] = limites_mesa.encolher_contorno(contorno, margem)
     return encolhidos
-
-
-# ------------------------------------------------ potencial continuo (opcional)
-
-def potencial(q, objetivo, obstaculos, k_attr=1.0, k_rep=0.001, d0=0.08,
-              d_max=0.3, limites=None):
-    """Potencial continuo total e seu gradiente em q."""
-    q = np.asarray(q, dtype=float)
-    objetivo = np.asarray(objetivo, dtype=float)
-
-    erro = q - objetivo
-    d_objetivo = np.linalg.norm(erro)
-    if d_objetivo <= d_max:
-        U = 0.5 * k_attr * d_objetivo ** 2
-        grad = k_attr * erro
-    else:
-        U = k_attr * d_max * d_objetivo - 0.5 * k_attr * d_max ** 2
-        grad = k_attr * d_max * erro / d_objetivo
-
-    fontes = []
-    for poligono in obstaculos:
-        d = dist_ponto_poligono(q, poligono)
-        if d < d0:
-            p = ponto_mais_proximo_poligono(q, poligono)
-            direcao = q - p
-            norma = np.linalg.norm(direcao)
-            if norma > 1e-9:
-                fontes.append((d, direcao / norma))
-
-    if limites:
-        paredes = [
-            (q[0] - limites["x_min"], np.array([1.0, 0.0])),
-            (limites["x_max"] - q[0], np.array([-1.0, 0.0])),
-            (q[1] - limites["y_min"], np.array([0.0, 1.0])),
-            (limites["y_max"] - q[1], np.array([0.0, -1.0])),
-        ]
-        fontes.extend((d, direcao) for d, direcao in paredes if d < d0)
-
-        contorno = limites_mesa.contorno_de_limites(limites)
-        if contorno is not None:
-            p = limites_mesa.ponto_mais_proximo_contorno(q, contorno)
-            dist = float(np.linalg.norm(q - p))
-            fora = not limites_mesa.dentro_varios(q, contorno)[0]
-            d = -dist if fora else dist
-            if d < d0 and dist > 1e-9:
-                fontes.append((d, (q - p) / dist))
-
-    for d, direcao in fontes:
-        if d <= 0.0:
-            d_eff = 1e-3
-            direcao = -direcao
-        else:
-            d_eff = d
-        eta = 1.0 / d_eff - 1.0 / d0
-        U += 0.5 * k_rep * eta ** 2 * d_objetivo ** 2
-        grad += k_rep * (
-            -eta * (1.0 / d_eff ** 2) * d_objetivo ** 2 * direcao
-            + eta ** 2 * erro
-        )
-
-    return U, grad
-
-
-def plan_potencial(inicio, objetivo, obstaculos, alpha=0.02, max_iter=5000,
-                   tol=0.01, passo_max=0.01, max_escapes=20,
-                   **kw_potencial):
-    """Descida de gradiente sobre o potencial continuo."""
-    limites = kw_potencial.get("limites")
-    q = np.array(inicio, dtype=float)
-    objetivo = np.array(objetivo, dtype=float)
-    caminho = [q.copy()]
-
-    def confinar(p):
-        if not limites:
-            return p
-        p = np.array([
-            np.clip(p[0], limites["x_min"], limites["x_max"]),
-            np.clip(p[1], limites["y_min"], limites["y_max"]),
-        ])
-        contorno = limites_mesa.contorno_de_limites(limites)
-        if contorno is not None and not limites_mesa.dentro_varios(p, contorno)[0]:
-            p = limites_mesa.ponto_mais_proximo_contorno(p, contorno)
-        return p
-
-    def livre(p):
-        return all(dist_ponto_poligono(p, o) > 0.0 for o in obstaculos)
-
-    def sentido_contorno(p, direcao_grad):
-        perp = np.array([-direcao_grad[1], direcao_grad[0]])
-        return 1.0 if perp @ (objetivo - p) >= 0.0 else -1.0
-
-    janela = 50
-    passos_tangencial = 0
-    sinal = 1.0
-    tentativas = 0
-    escapes = 0
-    d_anterior = np.linalg.norm(q - objetivo)
-
-    for it in range(max_iter):
-        if np.linalg.norm(q - objetivo) < tol:
-            return np.array(caminho), True
-
-        _, grad = potencial(q, objetivo, obstaculos, **kw_potencial)
-        norma = np.linalg.norm(grad)
-
-        if it > 0 and it % janela == 0:
-            d_atual = np.linalg.norm(q - objetivo)
-            if d_atual > d_anterior - 1e-4 and passos_tangencial == 0:
-                if escapes >= max_escapes:
-                    break
-                escapes += 1
-                if tentativas == 0 and norma > 1e-9:
-                    sinal = sentido_contorno(q, -grad / norma)
-                else:
-                    sinal = -sinal
-                tentativas += 1
-                passos_tangencial = (1 + tentativas) * janela
-            elif d_atual < d_anterior - 1e-4:
-                tentativas = 0
-            d_anterior = d_atual
-
-        if norma < 1e-9:
-            if escapes >= max_escapes:
-                break
-            escapes += 1
-            passos_tangencial = 2 * janela
-            direcao = objetivo - q
-            norma = np.linalg.norm(direcao)
-            direcao = direcao / norma
-            norma = passo_max / max(alpha, 1e-9)
-            sinal = sentido_contorno(q, direcao) if tentativas == 0 else -sinal
-            tentativas += 1
-        else:
-            direcao = -grad / norma
-
-        if passos_tangencial > 0:
-            direcao = sinal * np.array([-direcao[1], direcao[0]])
-            passos_tangencial -= 1
-
-        comprimento = min(alpha * norma, passo_max)
-        perp = np.array([-direcao[1], direcao[0]])
-        q_novo = None
-        for escala in (1.0, 0.5, 0.25):
-            for cand in (direcao, sinal * perp, -sinal * perp):
-                tentativa = confinar(q + escala * comprimento * cand)
-                if livre(tentativa):
-                    q_novo = tentativa
-                    break
-            if q_novo is not None:
-                break
-
-        if q_novo is None:
-            break
-
-        q = q_novo
-        caminho.append(q.copy())
-
-    sucesso = np.linalg.norm(q - objetivo) < tol
-    return np.array(caminho), sucesso
 
 
 # ----------------------------------------- Grid + Brushfire + Potencial + A*
@@ -1081,179 +923,6 @@ def plotar_opencv(caminho, obstaculos, expandidos, inicio, objetivo, limites,
     print(f"[OK] Figura salva em '{arquivo}' (via OpenCV)")
 
 
-# ------------------------------------------- Comunicacao com o Robo (demo.py)
-
-def list_ports():
-    ports = serial.tools.list_ports.comports()
-    if not ports:
-        print("Nenhuma porta serial encontrada.")
-        return
-    print("Portas disponíveis:")
-    for p in ports:
-        print(f"  {p.device:20s}  {p.description}")
-
-
-def connect(port=DEFAULT_PORT, baud=DEFAULT_BAUD):
-    ser = serial.Serial(port, baud, timeout=TIMEOUT_S)
-    time.sleep(1.5)
-    ser.reset_input_buffer()
-    return ser
-
-
-def send(ser, cmd):
-    ser.write(f"<{cmd}>\n".encode("ascii"))
-    ser.flush()
-
-
-def read_response(ser, timeout=RESPONSE_TIMEOUT_S):
-    t0 = time.time()
-    buf = bytearray()
-    while time.time() - t0 < timeout:
-        b = ser.read(1)
-        if not b:
-            continue
-        buf += b
-        if b == b"\n":
-            line = buf.decode("ascii", errors="replace").strip()
-            if line.startswith("<") and line.endswith(">"):
-                return line
-            buf = bytearray()
-    return None
-
-
-def cmd_and_wait(ser, cmd, timeout=RESPONSE_TIMEOUT_S):
-    send(ser, cmd)
-    return read_response(ser, timeout)
-
-
-def add_waypoint(ser, x, y, th=0.0):
-    return cmd_and_wait(ser, f"A,{x:.3f},{y:.3f},{th:.1f}")
-
-
-def set_waypoints(ser, pts):
-    if not pts:
-        return cmd_and_wait(ser, "C")
-    body = f"W,{len(pts)}"
-    for pt in pts:
-        x, y = float(pt[0]), float(pt[1])
-        th = float(pt[2]) if len(pt) >= 3 else 0.0
-        body += f",{x:.3f},{y:.3f},{th:.1f}"
-    return cmd_and_wait(ser, body)
-
-
-def append_waypoints(ser, pts):
-    if not pts:
-        return None
-    body = f"Q,{len(pts)}"
-    for pt in pts:
-        x, y = float(pt[0]), float(pt[1])
-        th = float(pt[2]) if len(pt) >= 3 else 0.0
-        body += f",{x:.3f},{y:.3f},{th:.1f}"
-    return cmd_and_wait(ser, body)
-
-
-def list_waypoints(ser):
-    resp = cmd_and_wait(ser, "L")
-    if resp is None or not resp.startswith("<L,"):
-        return None
-    parts = resp[1:-1].split(",")[1:]
-    n = int(parts[0])
-    wps = []
-    for i in range(n):
-        x = float(parts[1 + 3 * i])
-        y = float(parts[2 + 3 * i])
-        th = float(parts[3 + 3 * i])
-        wps.append((x, y, th))
-    return wps
-
-
-def delete_waypoint(ser, idx):
-    return cmd_and_wait(ser, f"D,{idx}")
-
-
-def replace_waypoint(ser, idx, x, y, th=0.0):
-    return cmd_and_wait(ser, f"S,{idx},{x:.3f},{y:.3f},{th:.1f}")
-
-
-def start(ser, wait_auto_eq=True):
-    resp = cmd_and_wait(ser, "R")
-    if resp is None:
-        return False, None, "sem resposta (timeout)"
-    if resp != "<OK>":
-        if resp == "<ERR>":
-            return False, resp, "lista vazia — envie waypoints antes de <R>"
-        return False, resp, f"resposta inesperada: {resp}"
-    if wait_auto_eq:
-        time.sleep(START_GRACE_S)
-    return True, resp, "navegação iniciada"
-
-
-def stop(ser):
-    return cmd_and_wait(ser, "C")
-
-
-def goto(ser, x, y, th=0.0):
-    return cmd_and_wait(ser, f"G,{x:.3f},{y:.3f},{th:.1f}")
-
-
-def set_pose(ser, x, y, th):
-    return cmd_and_wait(ser, f"O,{x:.3f},{y:.3f},{th:.1f}")
-
-
-def get_telemetry(ser, timeout=RESPONSE_TIMEOUT_S):
-    """Envia <T> e devolve dict com pose/estado do firmware, ou None."""
-    resp = cmd_and_wait(ser, "T", timeout)
-    if resp is None or not resp.startswith("<T,"):
-        return None
-    parts = resp[3:-1].split(",")
-    if len(parts) != 7:
-        return None
-    try:
-        return {
-            "x": float(parts[0]),
-            "y": float(parts[1]),
-            "th_deg": float(parts[2]),
-            "wp": int(parts[3]),
-            "state": int(parts[4]),
-            "v": float(parts[5]),
-            "w_deg": float(parts[6]),
-        }
-    except ValueError:
-        return None
-
-
-def format_telemetry(t):
-    if t is None:
-        return "(sem telemetria)"
-    st = STATE_NAMES.get(t["state"], "?")
-    return (
-        f"x={t['x']:+.3f}m  y={t['y']:+.3f}m  "
-        f"th={t['th_deg']:+7.2f}°  "
-        f"wp={t['wp']:2d}  st={st:5s}  "
-        f"v={t['v']:+.3f}m/s  w={t['w_deg']:+6.2f}°/s"
-    )
-
-
-def wait_until_done_telemetry(ser, poll_s=0.4, timeout_s=120.0):
-    """Monitora via <T> até pos_state == DONE (2) ou timeout."""
-    t0 = time.time()
-    last_wp = -1
-    while time.time() - t0 < timeout_s:
-        t = get_telemetry(ser)
-        if t is None:
-            time.sleep(poll_s)
-            continue
-        if t["wp"] != last_wp:
-            print(f"  [{time.time()-t0:5.1f}s] WP {t['wp']} -> {format_telemetry(t)}")
-            last_wp = t["wp"]
-        else:
-            print(f"  [{time.time()-t0:5.1f}s] {format_telemetry(t)}")
-        if t["state"] == 2:  # DONE
-            return True, t
-        time.sleep(poll_s)
-    return False, None
-
-
 def compensar_deriva_odometria(pos_ini, waypoints, fator_escala=1.0,
                                comp_angular_graus=0.0):
     """Pre-compensa erros sistematicos da odometria interna do robo sem camera.
@@ -1287,14 +956,8 @@ def main():
         description="Gera trajetoria por Campos de Potencial em Grid "
                     "(Brushfire + A* + Minkowski) e envia ao robo.")
     ap.add_argument("--mapa", default="mapa_obstaculos.json")
-    ap.add_argument("--inicio", type=float, nargs=2, default=None,
-                    help="ponto inicial [m]; o padrao e a pose do robo "
-                         "lida do mapa")
     ap.add_argument("--objetivo", type=float, nargs=2, default=[0.7, 0.6],
                     help="ponto objetivo [x y] em metros (padrao: 0.7 0.6)")
-    ap.add_argument("--metodo", choices=("grid", "potencial"), default="grid",
-                    help="grid: Brushfire + Potencial + A* sobre grade (padrao); "
-                         "potencial: descida de gradiente continua")
     ap.add_argument("--passo", type=float, default=0.02,
                     help="[grid] lado da celula da grade [m] (padrao 0.02)")
     ap.add_argument("--sem-suavizar", action="store_true",
@@ -1332,14 +995,9 @@ def main():
     ap.add_argument("--max-iter", type=int, default=5000)
     ap.add_argument("--saida", default="trajetoria.json")
     ap.add_argument("--figura", default="trajetoria.png")
-    ap.add_argument("--sem-envio", action="store_true",
-                    help="so gera a trajetoria e a figura, sem abrir a "
-                         "porta serial nem enviar waypoints")
-    ap.add_argument("--port", default=DEFAULT_PORT,
-                    help="Porta serial utilizada para a comunicacao com o robo")
-    ap.add_argument("--baud", type=int, default=DEFAULT_BAUD,
-                    help="Baudrate utilizado para a comunicacao com o robo")
-
+    ap.add_argument("--tol", type=float, help="tolerancia [m] do erro do EKF (padrão 0.1)", default=0.1)
+    ap.add_argument("--only-gen-path", action="store_true", help="gera apenas a trajetoria")
+    ap.add_argument("--only_send_path", action="store_true", help="envia apenas a trajetoria ao robo")
     args = ap.parse_args()
 
     # Garante a restricao do professor: no maximo 15 waypoints alem do ponto inicial
@@ -1348,15 +1006,6 @@ def main():
               f"(1 ponto inicial + {MAX_WAYPOINTS_ROBO} waypoints maximos).")
         args.max_pontos = MAX_PONTOS_TRAJETORIA
 
-    ser = None
-    try:
-        if not args.sem_envio:
-            ser = connect(args.port, args.baud)
-    except serial.SerialException as e:
-        print(f"[AVISO] Não consegui abrir {args.port} @ {args.baud}: {e}")
-        print("Verifique: HC-05 emparelhado, Monitor Serial fechado, porta correta.")
-        sys.exit(1)
-
     try:
         obstaculos, limites, robo = carregar_mapa(args.mapa)
         print(f"[OK] {len(obstaculos)} obstaculos lidos de '{args.mapa}'")
@@ -1364,15 +1013,14 @@ def main():
         obstaculos, limites, robo = mapa_exemplo()
         print(f"[AVISO] '{args.mapa}' nao encontrado; usando mapa de exemplo")
 
-    if args.inicio is None:
-        args.inicio = pose_inicial(robo)
-        if args.inicio is None:
-            print("[ERRO] O mapa nao traz a pose do robo (bloco 'robo'); "
-                  "informe --inicio x y")
-            return
-        theta = robo.get("theta_graus")
-        print(f"[OK] Inicio lido do mapa: {args.inicio} "
-              + (f"(theta {theta} graus)" if theta is not None else ""))
+    inicio_robo = pose_inicial(robo)
+    if inicio_robo is None:
+        print("[ERRO] O mapa nao traz a pose do robo (bloco 'robo'); "
+                "informe --inicio x y")
+        return
+    theta = robo.get("theta_graus")
+    print(f"[OK] Inicio lido do mapa: {inicio_robo} "
+            + (f"(theta {theta} graus)" if theta is not None else ""))
 
     # Soma de Minkowski: obstaculos inflados pelo raio do robo + margem
     raio = args.raio_robo + args.margem
@@ -1383,7 +1031,7 @@ def main():
               f"(robo {args.raio_robo} m + folga {args.margem} m): "
               f"{len(obstaculos)} -> {len(expandidos)} poligonos")
 
-    for nome, ponto in (("inicio", args.inicio), ("objetivo", args.objetivo)):
+    for nome, ponto in (("inicio", inicio_robo), ("objetivo", args.objetivo)):
         if not limites_mesa.ponto_dentro(ponto, limites_c):
             print(f"[AVISO] O {nome} {ponto} esta proximo da borda da mesa "
                   f"(dentro da margem de {raio:.2f} m); ajustando para celula livre mais proxima.")
@@ -1400,59 +1048,40 @@ def main():
               f"--max-pontos ({args.max_pontos})")
         return
 
-    if args.metodo == "grid":
-        caminho, sucesso = plan_grid(
-            args.inicio, args.objetivo, expandidos, limites_c,
-            passo=args.passo, suavizar=not args.sem_suavizar,
-            min_pontos=args.min_pontos, max_pontos=args.max_pontos,
-            d0_rep=args.d0, peso_rep=args.peso_rep)
-    else:
-        caminho, sucesso = plan_potencial(
-            args.inicio, args.objetivo, expandidos,
-            alpha=args.alpha, max_iter=args.max_iter,
-            k_attr=args.k_attr, k_rep=args.k_rep, d0=args.d0,
-            limites=limites_c)
-        if args.max_pontos and len(caminho) > args.max_pontos:
-            antes = len(caminho)
-            caminho, cabe = limitar_pontos(
-                caminho, args.max_pontos,
-                lambda a, b: _visada_poligonos(a, b, expandidos, limites_c))
-            print(f"[OK] Trajetoria reduzida de {antes} para "
-                  f"{len(caminho)} pontos (limite {args.max_pontos})")
-            if not cabe:
-                print(f"[AVISO] Nao foi possivel descer a "
-                      f"{args.max_pontos} pontos sem cortar obstaculo; "
-                      f"ficaram {len(caminho)}")
-
+    
+    caminho, sucesso = plan_grid(
+        inicio_robo, args.objetivo, expandidos, limites_c,
+        passo=args.passo, suavizar=not args.sem_suavizar,
+        min_pontos=args.min_pontos, max_pontos=args.max_pontos,
+        d0_rep=args.d0, peso_rep=args.peso_rep)
     if sucesso:
         comprimento = float(np.sum(np.linalg.norm(
             np.diff(caminho, axis=0), axis=1)))
         print(f"[OK] Objetivo alcancado: {len(caminho) - 1} waypoints "
               f"({len(caminho)} pontos contando inicio), "
               f"comprimento {comprimento:.4f} m")
-    elif args.metodo == "grid":
-        print("[AVISO] Nenhum caminho encontrado")
     else:
-        print(f"[AVISO] Parou em {caminho[-1].round(4).tolist()} "
-              f"apos {len(caminho)} passos (possivel minimo local)")
+        print("[AVISO] Nenhum caminho encontrado")
 
     theta_inicial = robo.get("theta_rad") if robo else None
     theta_inicial_graus = robo.get("theta_graus") if robo else None
 
+    
+
     with open(args.saida, "w", encoding="utf-8") as f:
         json.dump({
-            "inicio_xy_m": list(args.inicio),
+            "inicio_xy_m": list(inicio_robo),
             "objetivo_xy_m": list(args.objetivo),
             "theta_inicial_robo_rad": theta_inicial,
             "theta_inicial_robo_graus": theta_inicial_graus,
-            "metodo": args.metodo,
-            "passo_grid_m": args.passo if args.metodo == "grid" else None,
-            "d0_brushfire_m": args.d0 if args.metodo == "grid" else None,
-            "peso_rep_brushfire": args.peso_rep if args.metodo == "grid" else None,
+            "metodo": "grid",
+            "passo_grid_m": args.passo,
+            "d0_brushfire_m": args.d0,
+            "peso_rep_brushfire": args.peso_rep,
             "sucesso": bool(sucesso),
             "num_pontos": int(len(caminho)),
             "num_waypoints": int(max(0, len(caminho) - 1)),
-            "max_waypoints": MAX_WAYPOINTS_ROBO,
+            "max_waypoints": args.max_pontos,
             "raio_robo_m": args.raio_robo,
             "margem_seguranca_m": args.margem,
             "raio_inflado_m": raio,
@@ -1465,35 +1094,42 @@ def main():
         }, f, indent=4)
     print(f"[OK] Trajetoria salva em '{args.saida}'")
 
-    grid = None
-    if args.metodo == "grid":
-        livre, origem = construir_grid(expandidos, limites_c, args.passo)
-        objetivo_ij = _celula(args.objetivo, origem, args.passo, livre.shape)
-        objetivo_ij = _celula_livre_mais_proxima(objetivo_ij, livre)
-        valores = (mapa_wavefront(livre, objetivo_ij)
-                   if objetivo_ij is not None else None)
-        grid = (livre, origem, args.passo, valores)
+    livre, origem = construir_grid(expandidos, limites_c, args.passo)
+    objetivo_ij = _celula(args.objetivo, origem, args.passo, livre.shape)
+    objetivo_ij = _celula_livre_mais_proxima(objetivo_ij, livre)
+    valores = (mapa_wavefront(livre, objetivo_ij)
+                if objetivo_ij is not None else None)
+    grid = (livre, origem, args.passo, valores)
 
     try:
         if grid is not None and valores is not None and livre.size <= 4000:
-            plotar_valores(caminho, obstaculos, args.inicio, args.objetivo,
+            plotar_valores(caminho, obstaculos, inicio_robo, args.objetivo,
                            grid, args.figura)
         else:
             if grid is not None:
                 print(f"[AVISO] {livre.size} celulas: numeros ilegiveis, "
                       f"desenhando o campo em cores (use --passo maior "
                       f"para a tabela de valores)")
-            plotar(caminho, obstaculos, expandidos, args.inicio,
+            plotar(caminho, obstaculos, expandidos, inicio_robo,
                    args.objetivo, limites, args.figura, grid=grid)
     except ImportError:
         try:
-            plotar_opencv(caminho, obstaculos, expandidos, args.inicio,
+            plotar_opencv(caminho, obstaculos, expandidos, inicio_robo,
                           args.objetivo, limites, args.figura, grid=grid)
         except Exception as e:
             print(f"[AVISO] matplotlib indisponivel e falha no OpenCV ({e}); figura nao gerada")
 
     # Envio para o robo usando exclusivamente a odometria interna (protocolo demo.py)
-    if sucesso and ser is not None:
+    if not args.only_gen_path:
+        try:
+            active_runner = {"r": None}
+            ser, rx_q, running, t = ps.connect(DEFAULT_PORT, DEFAULT_BAUD, 60.0)
+        except serial.SerialException as e:
+            print(f"[ERRO] Falha ao conectar ao robo: {e}")
+            sys.exit(1)
+        print("[OK] Conectado ao robo")
+    
+    if sucesso and ser is not None and not args.only_gen_path:
         try:
             waypoints = caminho[1:].copy()
             if len(waypoints) > MAX_WAYPOINTS_ROBO:
@@ -1535,22 +1171,22 @@ def main():
             print(f"[OK] Enviando pose inicial e {len(waypoints_cmd)} waypoints "
                   f"(maximo permitido: {MAX_WAYPOINTS_ROBO})...")
 
-            # 1. Para e limpa lista anterior (<C>)
-            stop(ser)
+            
 
             # 2. Define pose inicial completa (x, y, theta_inicial em graus) via <O,x,y,th>
-            resp_pose = set_pose(ser, rx, ry_cmd, theta_cmd_deg)
-            print(f"[INFO] Pose inicial definida: <O,{rx:.3f},{ry_cmd:.3f},{theta_cmd_deg:.1f}> -> {resp_pose}")
+            resp_pose = ps.set_pose(ser, rx, ry_cmd, theta_cmd_deg)
+            print(f"[INFO] Pose inicial definida {resp_pose}")
 
             # 3. Envia lista de waypoints com theta = 0.0 via <W,n,x0,y0,0.0,...>
             pts_envio = [(float(wp[0]), float(wp[1]), 0.0) for wp in waypoints_cmd]
             resp_wp = set_waypoints(ser, pts_envio)
             if resp_wp is None or not resp_wp.startswith("<OK"):
                 # Fallback: adiciona um por um via <A,x,y,0.0>
-                stop(ser)
-                set_pose(ser, rx, ry_cmd, theta_cmd_deg)
+                ps.send_v(ser, 0.0, 0.0)
+                resp_pose = ps.set_pose(ser, rx, ry_cmd, theta_cmd_deg)
                 for i, (wx, wy, wth) in enumerate(pts_envio, 1):
-                    r_add = add_waypoint(ser, wx, wy, wth)
+                    resp_go = ps.go(ser, rx_q, active_runner, wx, wy, wth)
+                    
                     print(f"  [WP {i:2d}/{len(pts_envio)}] ({wx:.3f}, {wy:.3f}, {wth:.1f}) -> {r_add}")
             else:
                 for i, (wx, wy, wth) in enumerate(pts_envio, 1):
@@ -1571,7 +1207,7 @@ def main():
                     print("\n[AVISO] Monitoramento interrompido pelo usuário. Enviando <C> (stop)...")
                     stop(ser)
         finally:
-            ser.close()
+            ps.close(ser, running, t)
 
 
 if __name__ == "__main__":
