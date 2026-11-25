@@ -1186,7 +1186,6 @@ def main():
                 resp_pose = ps.set_pose(ser, rx, ry_cmd, theta_cmd_deg)
                 for i, (wx, wy, wth) in enumerate(pts_envio, 1):
                     resp_go = ps.go(ser, rx_q, active_runner, wx, wy, wth)
-                    
                     print(f"  [WP {i:2d}/{len(pts_envio)}] ({wx:.3f}, {wy:.3f}, {wth:.1f}) -> {r_add}")
             else:
                 for i, (wx, wy, wth) in enumerate(pts_envio, 1):
